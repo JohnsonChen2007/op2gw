@@ -102,6 +102,122 @@ test('the chat free-lane gate injects bash and read and pins tool_choice when th
 })
 
 /**
+ * Regression: reasoning effort was silently dropped in BOTH translation
+ * directions. Both translators are whitelist rebuilds, so a client asking for
+ * `xhigh` got the model's default effort and no error anywhere — worst kind of
+ * failure, because the response looks perfectly healthy.
+ */
+test('chat -> responses carries reasoning_effort across as reasoning.effort', () => {
+  const out = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: 'xhigh',
+    stream: true,
+  })
+  assert.deepEqual(out.reasoning, { effort: 'xhigh' })
+  assert.equal(out.reasoning_effort, undefined, 'the flat chat field must not leak into the responses body')
+})
+
+test('chat -> responses accepts the nested reasoning shape a client may send instead', () => {
+  const out = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning: { effort: 'minimal', summary: 'auto' },
+  })
+  assert.deepEqual(out.reasoning, { effort: 'minimal' })
+})
+
+test('responses -> chat carries reasoning.effort across as reasoning_effort', () => {
+  const out = responsesToChatBody({
+    model: 'big-pickle',
+    input: [{ role: 'user', content: 'hi' }],
+    reasoning: { effort: 'high' },
+  })
+  assert.equal(out.reasoning_effort, 'high')
+  assert.equal(out.reasoning, undefined, 'the nested field must not leak into the chat body')
+})
+
+test('responses -> chat accepts a flat reasoning_effort from the client', () => {
+  const out = responsesToChatBody({
+    model: 'big-pickle',
+    input: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: 'medium',
+  })
+  assert.equal(out.reasoning_effort, 'medium')
+})
+
+test('a malformed effort is never forwarded to upstream, while junk siblings are ignored', () => {
+  // Negative half: nothing recognisable means no field at all, so the gateway
+  // cannot hand upstream a shape it would reject.
+  for (const value of [undefined, null, '', '   ', 42, {}, []]) {
+    const chat = chatToResponsesBody({
+      model: 'muse-spark-1.3-contributor-free',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: value,
+    })
+    assert.equal(chat.reasoning, undefined, `chat body must not grow a reasoning field for ${JSON.stringify(value)}`)
+
+    const responses = responsesToChatBody({
+      model: 'big-pickle',
+      input: [{ role: 'user', content: 'hi' }],
+      reasoning: { effort: value },
+    })
+    assert.equal(responses.reasoning_effort, undefined, `responses body must not grow an effort field for ${JSON.stringify(value)}`)
+  }
+  // Positive half: a usable value still wins over unrecognised siblings, and the
+  // emitted object stays exactly {effort} rather than inheriting the junk.
+  const withJunk = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning: { effort: 'high', bogus: 1, nested: { deep: true } },
+  })
+  assert.deepEqual(withJunk.reasoning, { effort: 'high' })
+})
+
+test('the native spelling wins over the foreign one, and an unusable native falls through', () => {
+  // Both spellings, different values: the dialect-native one decides. Mirrored
+  // in each direction, so the two clients that differ here are both pinned.
+  assert.deepEqual(
+    chatToResponsesBody({
+      model: 'muse-spark-1.3-contributor-free',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 'xhigh',
+      reasoning: { effort: 'low' },
+    }).reasoning,
+    { effort: 'xhigh' },
+  )
+  assert.equal(
+    responsesToChatBody({
+      model: 'big-pickle',
+      input: [{ role: 'user', content: 'hi' }],
+      reasoning: { effort: 'high' },
+      reasoning_effort: 'low',
+    }).reasoning_effort,
+    'high',
+  )
+  // Native present but unusable -> fall through to the foreign value, rather
+  // than dropping the request's intent entirely.
+  assert.deepEqual(
+    chatToResponsesBody({
+      model: 'muse-spark-1.3-contributor-free',
+      messages: [{ role: 'user', content: 'hi' }],
+      reasoning_effort: 0,
+      reasoning: { effort: 'low' },
+    }).reasoning,
+    { effort: 'low' },
+  )
+})
+
+test('the effort token is trimmed so a padded client value is still accepted', () => {
+  const out = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [{ role: 'user', content: 'hi' }],
+    reasoning_effort: '  xhigh  ',
+  })
+  assert.deepEqual(out.reasoning, { effort: 'xhigh' })
+})
+
+/**
  * Regression: the aggregator used to attach listeners to a paused stream and
  * await its 'end' event, which never fired — a non-streaming chat client on a
  * Responses-wire model hung instead of getting its answer.

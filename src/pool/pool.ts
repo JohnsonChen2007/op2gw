@@ -72,6 +72,7 @@ export class ExitPool {
   #bans = new Map<string, ModelBan>() // key: `${exitId}\0${model}`
   #sticky = new Map<string, string>() // session -> exitId
   #pinnedId = ''
+  #rrIndex = 0
   /**
    * When false, the 'direct' exit is never returned by pick(): the pool will
    * go exit-starved rather than leak the operator's real egress IP. This is
@@ -214,18 +215,32 @@ export class ExitPool {
   /**
    * Pick an exit for (model, session). Order: sticky binding (if still usable)
    * -> pinned (if usable) -> best usable candidate (freshest health, lowest
-   * latency). Returns null when nothing is usable.
+   * latency / load-balanced top tier). Accepts an optional `exclude` set of exit IDs
+   * to avoid retrying exits that already failed for this request.
    */
-  pick(model: string, session: string): PickResult | null {
+  pick(model: string, session: string, exclude?: Set<string>): PickResult | null {
     const stickyId = this.#sticky.get(session)
-    if (stickyId && this.#eligible(stickyId) && this.isUsable(stickyId, model)) {
+    if (stickyId && (!exclude || !exclude.has(stickyId)) && this.#eligible(stickyId) && this.isUsable(stickyId, model)) {
       return { exit: this.#exits.get(stickyId)!, sticky: true }
     }
-    if (this.#pinnedId && this.#eligible(this.#pinnedId) && this.isUsable(this.#pinnedId, model)) {
+    if (this.#pinnedId && (!exclude || !exclude.has(this.#pinnedId)) && this.#eligible(this.#pinnedId) && this.isUsable(this.#pinnedId, model)) {
       this.#sticky.set(session, this.#pinnedId)
       return { exit: this.#exits.get(this.#pinnedId)!, sticky: false }
     }
-    const candidates = [...this.#exits.values()].filter((n) => this.isUsable(n.id, model))
+    let candidates = [...this.#exits.values()].filter(
+      (n) => (!exclude || !exclude.has(n.id)) && this.isUsable(n.id, model),
+    )
+    if (candidates.length === 0) {
+      // Model-ban relief: if every eligible proxy is alive (not dead, not cooling)
+      // but marked model-banned due to transient upstream 5xx spikes, allow an alive
+      // eligible candidate to be sampled so the system can self-heal on recovery.
+      candidates = [...this.#exits.values()].filter((n) => {
+        if (exclude && exclude.has(n.id)) return false
+        if (!this.#eligible(n.id)) return false
+        const health = this.#health.get(n.id)
+        return health && health.state !== 'dead' && health.cooldownUntil <= this.#now()
+      })
+    }
     if (candidates.length === 0) return null
     candidates.sort((a, b) => {
       // pinned first, then lower latency, then most-recently-added.
@@ -235,7 +250,17 @@ export class ExitPool {
       if (la !== lb) return la - lb
       return b.addedAt - a.addedAt
     })
-    const chosen = candidates[0]!
+    const bestCandidate = candidates[0]!
+    const bestLatency = bestCandidate.latencyMs || 0
+    const tolerance = Math.max(30, bestLatency * 0.3)
+    const topTier = candidates.filter((c) => {
+      if (c.pinned !== bestCandidate.pinned) return false
+      const lat = c.latencyMs || 0
+      return Math.abs(lat - bestLatency) <= tolerance
+    })
+    const chosen = topTier.length > 1
+      ? topTier[(this.#rrIndex++) % topTier.length]!
+      : bestCandidate
     this.#sticky.set(session, chosen.id)
     return { exit: chosen, sticky: false }
   }

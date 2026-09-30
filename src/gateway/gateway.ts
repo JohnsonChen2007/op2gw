@@ -121,10 +121,14 @@ export class Gateway {
       : 1
     const story: string[] = []
     let lastError: UpstreamError | Error | null = null
+    const triedExits = new Set<string>()
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const exit = this.#pickExit(model, ids.session)
+      const exit = this.#pickExit(model, ids.session, triedExits)
       if (!exit) {
+        if (triedExits.size > 0 && lastError) {
+          break
+        }
         const directAllowed = this.#d.directAllowed ?? this.#d.pool.includeDirect
         throw new GatewayHttpError(
           503,
@@ -134,6 +138,7 @@ export class Gateway {
             : 'no usable proxy exit available (all cooling/dead/banned) and direct egress is disallowed — add or enable a proxy',
         )
       }
+      triedExits.add(exit.id)
       if (this.#sealDirect(model) && exit.kind === 'direct') {
         // Belt and braces: the pool already filters direct when egress is
         // locked to proxies. If one still slips through, refuse rather than
@@ -195,20 +200,26 @@ export class Gateway {
       } catch (err) {
         lastError = err as Error
         const kind = (err as UpstreamError).kind ?? 'transport'
-        this.#d.pool.markFailure(exit.id, model, kind)
+        const status = (err as UpstreamError).status
+        // A 400 from upstream is a client/request validation error (e.g. invalid param,
+        // malformed prompt). It is NOT an exit/proxy node failure and must NOT penalize the exit.
+        if (status !== 400) {
+          this.#d.pool.markFailure(exit.id, model, kind)
+        }
         story.push(`#${attempt} ${exit.id} ${kind}: ${(err as Error).message.slice(0, 80)}`)
         log.warn('attempt failed', { model, exit: exit.id, attempt, kind, error: (err as Error).message })
-        const status = (err as UpstreamError).status
-        // Deterministic client errors (region) still allow a rotate to another
-        // exit; other non-retryable statuses (400 from our own guard already
-        // handled) surface. We keep rotating within budget on exit-shaped
-        // failures only.
-        const rotatable = kind === 'limited' || kind === 'transport' || kind === 'server' || kind === 'refused' || kind === 'region'
+        // Non-retryable statuses (400) surface immediately; we keep rotating within
+        // budget on exit-shaped failures only.
+        const rotatable = status !== 400 && (kind === 'limited' || kind === 'transport' || kind === 'server' || kind === 'refused' || kind === 'region')
         if (!rotatable || attempt >= maxAttempts) {
           break
         }
         // Break the sticky binding so the next pick moves to a fresh exit.
         this.#d.pool.rerouteSession(ids.session)
+        // Brief backoff before rotating to give overloaded upstreams or rate-limited tunnels a moment.
+        if (kind === 'server' || kind === 'limited') {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(attempt * 400, 1500)))
+        }
       }
     }
 
@@ -232,14 +243,14 @@ export class Gateway {
     throw new GatewayHttpError(status >= 400 ? status : 502, 'upstream_error', detail)
   }
 
-  #pickExit(model: string, session: string): ExitNode | null {
+  #pickExit(model: string, session: string, exclude?: Set<string>): ExitNode | null {
     const directAllowed = this.#d.directAllowed ?? this.#d.pool.includeDirect
     if (!this.#d.poolEnabled) {
-      if (!directAllowed || !this.#d.pool.includeDirect) return null
+      if (!directAllowed || !this.#d.pool.includeDirect || (exclude && exclude.has('direct'))) return null
       this.#d.pool.ensureDirect()
       return this.#d.pool.get('direct') ?? null
     }
-    const pick = this.#d.pool.pick(model, session)
+    const pick = this.#d.pool.pick(model, session, exclude)
     if (pick && pick.exit.kind === 'direct' && (!directAllowed || !this.#d.pool.includeDirect)) return null
     return pick?.exit ?? null
   }

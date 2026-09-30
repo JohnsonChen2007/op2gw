@@ -181,6 +181,35 @@ test('pick prefers sticky, then pinned, then lowest latency', () => {
   assert.equal(p4?.exit.id, 'http://fast:1')
 })
 
+test('pick excludes exits specified in exclude set during retry rotation', () => {
+  const pool = new ExitPool()
+  pool.add(node('http://exit-1:1', { latencyMs: 50 }))
+  pool.add(node('http://exit-2:1', { latencyMs: 60 }))
+  // Normal pick chooses exit-1
+  const p1 = pool.pick('m', 'sess-a')
+  assert.equal(p1?.exit.id, 'http://exit-1:1')
+  // Retrying with exclude={exit-1} guarantees routing to exit-2
+  const p2 = pool.pick('m', 'sess-a', new Set(['http://exit-1:1']))
+  assert.equal(p2?.exit.id, 'http://exit-2:1')
+  // If all usable exits are excluded, returns null
+  const p3 = pool.pick('m', 'sess-a', new Set(['http://exit-1:1', 'http://exit-2:1']))
+  assert.equal(p3, null)
+})
+
+test('pick round-robins across exits with comparable latency', () => {
+  const pool = new ExitPool()
+  pool.add(node('http://peer-a:1', { latencyMs: 650 }))
+  pool.add(node('http://peer-b:1', { latencyMs: 660 }))
+  // Latencies are within tolerance, successive picks for fresh sessions alternate
+  const p1 = pool.pick('m', 'fresh-1')
+  const p2 = pool.pick('m', 'fresh-2')
+  const p3 = pool.pick('m', 'fresh-3')
+  const p4 = pool.pick('m', 'fresh-4')
+  assert.notEqual(p1?.exit.id, p2?.exit.id, 'consecutive fresh sessions alternate between peers')
+  assert.equal(p1?.exit.id, p3?.exit.id)
+  assert.equal(p2?.exit.id, p4?.exit.id)
+})
+
 test('remove clears bans and sticky bindings for the exit', () => {
   const pool = new ExitPool()
   pool.add(node('http://a:1'))

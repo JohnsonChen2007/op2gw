@@ -5,7 +5,7 @@ import type { ScopedLogger } from '../core/logger.js'
 import { opencodeUserAgent } from '../core/ids.js'
 import { ANONYMOUS_KEY } from '../core/freelane.js'
 import type { FreeDecision } from '../core/types.js'
-import { fallbackFreeModels, verifiedFreeModels } from './static-models.js'
+import { fallbackFreeModels, verifiedFreeModels, disabledModels } from './static-models.js'
 
 /**
  * Model catalog with the S1/S2/S3 fallback chain.
@@ -290,6 +290,9 @@ export class ModelCatalog {
   }
 
   decision(model: string): FreeDecision {
+    if (disabledModels.includes(model)) {
+      return { allowed: false, source: 'model_disabled', known: true }
+    }
     const metadata = decideSold(model, this.#prices, this.#pricesReady, this.#zen.has(model))
     // S3 vouchers only speak when metadata cannot. They never override a ready
     // verdict (a paid row is authoritative).
@@ -303,11 +306,16 @@ export class ModelCatalog {
    * Ids exposed to clients: every in-sale model that is free, computed live
    * from the current S1 x S2 verdicts. Falls back to the verified bootstrap
    * list only while S1 has never produced a list (cold start / upstream down).
+   * Permanently broken/dead models are explicitly filtered out.
    */
   list(): string[] {
-    if (this.#zen.size === 0) return [...verifiedFreeModels]
+    if (this.#zen.size === 0) return [...verifiedFreeModels].filter((m) => !disabledModels.includes(m))
     const out: string[] = []
-    for (const model of this.#zen) if (this.decision(model).allowed) out.push(model)
+    for (const model of this.#zen) {
+      if (!disabledModels.includes(model) && this.decision(model).allowed) {
+        out.push(model)
+      }
+    }
     return out.sort()
   }
 

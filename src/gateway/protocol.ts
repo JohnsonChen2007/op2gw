@@ -53,6 +53,56 @@ function isRecord(v: unknown): v is Json {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
 }
 
+/**
+ * Reasoning effort is the one knob the two dialects spell differently: chat
+ * carries a flat `reasoning_effort` string, the Responses API nests it as
+ * `reasoning.effort`.
+ *
+ * Both request translators below are WHITELIST rebuilds — anything not named
+ * is dropped. An unmapped effort therefore fails SILENTLY: the client asks for
+ * `xhigh`, the model runs at its default effort, and nothing anywhere reports
+ * an error. That is the bug these helpers exist to close.
+ *
+ * Each reader also tolerates the *other* dialect's spelling, because a client is
+ * free to send either shape to either endpoint and dropping it would put us
+ * right back in the silent-failure case.
+ *
+ * Precedence, stated once so it is not re-guessed per call site:
+ *   1. the field NATIVE to the client's dialect wins;
+ *   2. the foreign spelling is a fallback, consulted only when the native one
+ *      is absent OR unusable (wrong type, blank);
+ *   3. if a client somehow sends both with DIFFERENT values, rule 1 decides and
+ *      the foreign value is discarded — a confused client keeps working instead
+ *      of being rejected, which is the same tolerance argument as (2).
+ *
+ * Note (2) is why the `??` sits after `effortToken` and not before it: a native
+ * value of `0`/`''`/`[]` is not a reason to prefer the foreign one, it is a
+ * reason to look further.
+ */
+
+/** A usable effort token, or undefined. Rejects non-strings and blank values. */
+function effortToken(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
+}
+
+/** Effort from a chat-shaped body (flat field, or nested if a client sent it). */
+function chatEffortOf(body: Json): string | undefined {
+  return (
+    effortToken(body.reasoning_effort) ??
+    effortToken(isRecord(body.reasoning) ? body.reasoning.effort : undefined)
+  )
+}
+
+/** Effort from a responses-shaped body (nested field, or flat if a client sent it). */
+function responsesEffortOf(body: Json): string | undefined {
+  return (
+    effortToken(isRecord(body.reasoning) ? body.reasoning.effort : undefined) ??
+    effortToken(body.reasoning_effort)
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Request translation
 // ---------------------------------------------------------------------------
@@ -125,9 +175,15 @@ export function chatToResponsesBody(body: Json): Json {
   if (typeof body.temperature === 'number') out.temperature = body.temperature
   if (typeof body.top_p === 'number') out.top_p = body.top_p
   const maxTokens = body.max_tokens ?? body.max_completion_tokens
-  if (typeof maxTokens === 'number') out.max_output_tokens = maxTokens
+  // Upstream Responses providers (such as Console for muse-spark) require max_output_tokens >= 16.
+  if (typeof maxTokens === 'number') out.max_output_tokens = Math.max(16, maxTokens)
   if (typeof body.parallel_tool_calls === 'boolean') out.parallel_tool_calls = body.parallel_tool_calls
   if (typeof body.user === 'string') out.metadata = { user_id: body.user }
+
+  // Reasoning effort: flat chat field -> nested Responses field. Dropping this
+  // is invisible in the response but silently caps the model at default effort.
+  const effort = chatEffortOf(body)
+  if (effort !== undefined) out.reasoning = { effort }
 
   const tools = Array.isArray(body.tools) ? body.tools : []
   const mapped = tools.map(chatToolToResponses).filter((t): t is Json => t !== null)
@@ -182,6 +238,11 @@ export function responsesToChatBody(body: Json): Json {
   if (typeof body.top_p === 'number') out.top_p = body.top_p
   if (typeof body.max_output_tokens === 'number') out.max_tokens = body.max_output_tokens
   if (typeof body.parallel_tool_calls === 'boolean') out.parallel_tool_calls = body.parallel_tool_calls
+
+  // Reasoning effort: nested Responses field -> flat chat field. Same silent
+  // failure as the other direction if this is not carried across.
+  const effort = responsesEffortOf(body)
+  if (effort !== undefined) out.reasoning_effort = effort
 
   const tools = Array.isArray(body.tools) ? body.tools : []
   const mapped = tools.map(responsesToolToChat).filter((t): t is Json => t !== null)

@@ -102,11 +102,14 @@ export async function handleAdmin(
 
   if (path === '/admin/pool/pin' && method === 'POST') {
     const body = await readJson(req)
-    const id = String((body as { id?: unknown }).id ?? '')
-    if (!runtime.pool.has(id)) return json(res, 404, { error: 'unknown exit' })
-    runtime.pool.setPinned(id)
-    runtime.logger.child('admin').info('exit pinned', { id })
-    return json(res, 200, { ok: true, pinned: id })
+    const id = String((body as { id?: unknown }).id ?? '').trim()
+    if (id && id !== 'none' && !runtime.pool.has(id)) return json(res, 404, { error: 'unknown exit' })
+    const target = (!id || id === 'none') ? '' : id
+    runtime.pool.setPinned(target)
+    runtime.config.pool.pinnedExitId = target
+    runtime.pool.clearSticky()
+    runtime.logger.child('admin').info('exit pinned updated', { id: target || '(unpinned)' })
+    return json(res, 200, { ok: true, pinned: target })
   }
 
   if (path === '/admin/pool/probe' && method === 'POST') {

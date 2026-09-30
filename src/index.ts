@@ -10,6 +10,12 @@ import { loadConfig } from './core/config.js'
 import { Runtime, VERSION } from './runtime.js'
 import { GatewayHttpError, type GatewayRequest } from './gateway/gateway.js'
 import { handleAdmin, json, readJson } from './admin/api.js'
+import {
+  chatToMessagesBody,
+  chatToMessagesStream,
+  messagesToChatBody,
+  toAnthropicErrorBody,
+} from './gateway/anthropic.js'
 
 /**
  * op2gw HTTP server.
@@ -19,6 +25,7 @@ import { handleAdmin, json, readJson } from './admin/api.js'
  *   GET  /v1/models                  OpenAI-compatible free-model list
  *   POST /v1/chat/completions        OpenAI Chat Completions (stream or not)
  *   POST /v1/responses               OpenAI Responses (muse-spark-* etc.)
+ *   POST /v1/messages                Anthropic Messages — Claude Code (additive)
  *   /admin/*                         debug backend (see admin/api.ts)
  *   /*                               static debug UI from public/
  *
@@ -103,6 +110,15 @@ async function main(): Promise<void> {
       return
     }
 
+    // Anthropic Messages surface (Claude Code). Additive: the request is
+    // translated to the OpenAI chat dialect and handed to the SAME gateway
+    // pipeline as /v1/chat/completions, then the response is translated back.
+    if (path === '/v1/messages' && req.method === 'POST') {
+      if (authRequired && !checkAuth(req, keySet)) return unauthorizedAnthropic(res)
+      await handleAnthropicMessages(req, res)
+      return
+    }
+
     // Static debug UI.
     await serveStatic(path, res)
   }
@@ -138,6 +154,92 @@ async function main(): Promise<void> {
       const message = err instanceof Error ? err.message : String(err)
       if (!res.headersSent) {
         json(res, 502, { error: { message, type: 'upstream_error' } })
+      } else {
+        res.end()
+      }
+    }
+  }
+
+  /**
+   * Claude Code's entry point: Anthropic Messages in, Anthropic Messages out.
+   *
+   * The request is translated to the OpenAI chat dialect and dispatched through
+   * the identical gateway path used by /v1/chat/completions, so the exit pool,
+   * rotation, free-lane gate and disguise headers all behave exactly as they do
+   * for OpenAI clients. Only the response envelope differs, so the translation
+   * is applied on the way out:
+   *   - streaming  -> chat SSE rewritten as Anthropic SSE events
+   *   - non-stream -> chat completion rewritten as an Anthropic message object
+   */
+  async function handleAnthropicMessages(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    let body: Record<string, unknown>
+    try {
+      body = (await readJson(req, 32 << 20)) as Record<string, unknown>
+    } catch {
+      res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(toAnthropicErrorBody('invalid JSON body', 'invalid_request_error'))
+      return
+    }
+
+    const requestedModel = typeof body.model === 'string' ? body.model : ''
+    const chatBody = messagesToChatBody(body)
+    const clientStream = body.stream === true
+    const abort = new AbortController()
+    req.on('close', () => abort.abort())
+
+    // `api: 'chat'` — the gateway's client dialect. From here on this is an
+    // ordinary OpenAI chat request; the Anthropic shape only reappears on the
+    // response below.
+    const gatewayReq: GatewayRequest = { api: 'chat', body: chatBody, clientStream, signal: abort.signal }
+    try {
+      const result = await runtime.gateway.handle(gatewayReq)
+      if (clientStream) {
+        res.writeHead(result.status, result.headers)
+        await pipeline(chatToMessagesStream(result.body, requestedModel), res)
+        return
+      }
+      // Non-streaming: the gateway returns a single chat-completion object.
+      // Aggregate it into the Anthropic message envelope.
+      const chunks: Buffer[] = []
+      for await (const chunk of result.body) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string))
+      }
+      const raw = Buffer.concat(chunks).toString('utf8')
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        parsed = {}
+      }
+      // An error object must keep its Anthropic shape, not become a message.
+      if (parsed && typeof parsed === 'object' && 'error' in (parsed as Record<string, unknown>)) {
+        const err = (parsed as { error: Record<string, unknown> }).error
+        res.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(
+          toAnthropicErrorBody(
+            typeof err.message === 'string' ? err.message : 'upstream error',
+            typeof err.type === 'string' ? err.type : 'api_error',
+          ),
+        )
+        return
+      }
+      const message = chatToMessagesBody(parsed, requestedModel)
+      res.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify(message))
+    } catch (err) {
+      if (err instanceof GatewayHttpError) {
+        if (!res.headersSent) {
+          res.writeHead(err.status, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(toAnthropicErrorBody(err.message, err.type))
+        } else {
+          res.end()
+        }
+        return
+      }
+      const message = err instanceof Error ? err.message : String(err)
+      if (!res.headersSent) {
+        res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(toAnthropicErrorBody(message, 'api_error'))
       } else {
         res.end()
       }
@@ -200,6 +302,11 @@ function checkAuth(req: IncomingMessage, keys: Set<string>): boolean {
 
 function unauthorized(res: ServerResponse): void {
   json(res, 401, { error: { message: 'missing or invalid API key', type: 'invalid_request_error' } })
+}
+
+function unauthorizedAnthropic(res: ServerResponse): void {
+  res.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'www-authenticate': 'Bearer' })
+  res.end(toAnthropicErrorBody('missing or invalid API key', 'authentication_error'))
 }
 
 main().catch((err) => {

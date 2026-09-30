@@ -15,19 +15,28 @@
  *    metadata cannot speak, so the free-model set does not silently shrink to
  *    "whatever models.dev happens to know".
  *
+ * 3. `disabledModels` — ids confirmed to be permanently dead/broken upstream
+ *    (e.g. "Model is unavailable", "Endpoint is unavailable", or 500 errors).
+ *    These are stripped from all exposed model lists and rejected immediately.
+ *
  * Neither list defines the exposed catalog: the exposed set is computed live
  * from S1 (in-sale) x S2 (zero-cost) plus the fallback voucher. Adding a model
  * upstream therefore requires no code change here.
  */
 
-/** Zero-cost ids absent from models.dev, verified against the live lane. */
-export const fallbackFreeModels: string[] = ['jev-1.13-free']
+/** Models permanently broken/dead upstream (excluded from catalog & requests). */
+export const disabledModels: string[] = [
+  'deepseek-v4-flash-free',   // Upstream: "Model is unavailable"
+  'jev-1.13-free',            // Upstream: 500 "Internal server error"
+  'ling-3.0-flash-fin-free',  // Upstream: "Endpoint is unavailable"
+]
 
-/** Small, verified subset used to bootstrap the list before S1 lands. */
+/** Zero-cost ids absent from models.dev, verified against the live lane. */
+export const fallbackFreeModels: string[] = []
+
+/** Verified working subset used to bootstrap the list before S1 lands. */
 export const verifiedFreeModels: string[] = [
   'big-pickle',
-  'deepseek-v4-flash-free',
-  'jev-1.13-free',
   'longcat-2.5-preview-free',
   'mimo-v2.5-free',
   'mimo-v2.6-flash-free',

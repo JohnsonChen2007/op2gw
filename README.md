@@ -293,6 +293,7 @@ for chunk in resp:
 | `GET /v1/models` | 免费模型清单（OpenAI 形状） |
 | `POST /v1/chat/completions` | Chat Completions（流式 / 非流式聚合） |
 | `POST /v1/responses` | Responses API（线协议由模型决定，与客户端协议无关，网关双向转码） |
+| `POST /v1/messages` | **Anthropic Messages —— Claude Code 直接接入**（新增，纯附加） |
 | `GET /admin/status` · `/admin/models` · `/admin/logs` · `/admin/logs/stream` · `/admin/traces` | 调试后端 |
 | `POST /admin/pool/exits` · `/admin/pool/pin` · `/admin/pool/refresh` · `/admin/catalog/refresh` | 调试控制 |
 | `GET /admin/settings` · `PUT /admin/settings` | 读取 / 更新配置（端口、代理、日志级别、密钥；代理与日志即时生效，端口保存后重启生效） |

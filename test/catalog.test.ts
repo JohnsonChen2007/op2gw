@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { decide, decodeModelsDev, isFreeByName, ModelCatalog } from '../dist/catalog/catalog.js'
 import type { ModelPrice } from '../dist/catalog/catalog.js'
-import { fallbackFreeModels, verifiedFreeModels } from '../dist/catalog/static-models.js'
+import { fallbackFreeModels, verifiedFreeModels, disabledModels } from '../dist/catalog/static-models.js'
 import type { ScopedLogger } from '../dist/core/logger.js'
 
 /**
@@ -89,9 +89,27 @@ test('an id missing from metadata is vouched for only when it is a known free id
   const prices = new Map<string, ModelPrice>([['known', price({})]])
   // 'hev-...' style unknown ids are not auto-admitted...
   assert.equal(decide('mystery-model', prices, true).allowed, false)
-  // ...but a name-marked free id is, and a curated fallback id is too.
+  // ...but a name-marked free id is
   assert.equal(decide('mystery-model-free', prices, true).allowed, true)
-  assert.ok(fallbackFreeModels.length > 0, 'the curated fallback list is non-empty')
+  assert.ok(disabledModels.length > 0, 'disabled models list contains broken upstream models')
+})
+
+test('disabledModels are filtered out from catalog decision and list', () => {
+  const catalog = new ModelCatalog({
+    zenBaseUrl: 'https://zen.example',
+    metadataUrl: 'https://metadata.example/api.json',
+    refreshSeconds: 300,
+    cachePath: '/tmp/op2gw-test-cache-disabled.json',
+    logger: silentLogger(),
+  })
+  for (const m of disabledModels) {
+    assert.equal(catalog.decision(m).allowed, false, `${m} is disallowed`)
+    assert.equal(catalog.decision(m).source, 'model_disabled')
+  }
+  const list = catalog.list()
+  for (const m of disabledModels) {
+    assert.equal(list.includes(m), false, `${m} is not in list()`)
+  }
 })
 
 /**

@@ -50,7 +50,7 @@ export function classifyTransport(message: string): FailureKind {
   const text = message.toLowerCase()
   if (/\b429\b|rate.?limit/.test(text)) return 'limited'
   if (/\b(401|403)\b|regionerror/.test(text)) return 'refused'
-  if (/\b5\d\d\b|internal server error/.test(text)) return 'server'
+  if (/\b5\d\d\b|internal server error|headers timeout|body timeout|socket timeout/i.test(text)) return 'server'
   return 'transport'
 }
 
@@ -98,6 +98,8 @@ export async function forwardUpstream(options: ForwardOptions): Promise<Upstream
       headers,
       body: JSON.stringify(options.body),
       signal: options.signal,
+      headersTimeout: options.api === 'responses' ? 300_000 : 120_000,
+      bodyTimeout: 0,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
