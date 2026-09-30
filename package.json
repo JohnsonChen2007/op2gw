@@ -18,7 +18,9 @@
     "serve": "node --experimental-strip-types src/index.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "pretest": "npm run build",
-    "test": "node --experimental-strip-types --test \"test/*.test.ts\""
+    "test": "node --experimental-strip-types --test \"test/*.test.ts\"",
+    "test:coverage": "node --experimental-strip-types --experimental-test-coverage --test \"test/*.test.ts\"",
+    "ci": "npm run typecheck && npm test"
   },
   "keywords": [
     "openai",

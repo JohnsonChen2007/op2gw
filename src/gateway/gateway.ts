@@ -165,7 +165,15 @@ export class Gateway {
         // the SSE body (observed on nemotron-3-ultra-free: an Nvidia 503 wrapped
         // as a chat chunk). That is a failure, not an empty answer: it must not
         // be marked as a model success, and a Responses client must be told.
-        await this.#inspectPreContentError(wireApi, result, model, exit.id, log)
+        //
+        // Streaming only: the peek consumes the head of `result.body` and replays
+        // it. In no-watchdog (non-streaming) mode body === rawBody, so peeking
+        // here would steal the first chunk from the aggregator below. The
+        // aggregators (aggregateSse / *Completion) detect in-body errors
+        // themselves, so non-streaming clients skip this step.
+        if (req.clientStream) {
+          await this.#inspectPreContentError(wireApi, result, model, exit.id, log)
+        }
         const trace: RequestTrace = {
           id: requestId,
           ts: started,
