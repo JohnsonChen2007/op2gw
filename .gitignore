@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+
+# Logs & temp files
+*.log
+*.tmp
+*.temp
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE & Editor files
+.vscode/
+.idea/
+
+# Local configs and caches (contains credentials/endpoints)
+config.json
+status.json
+*.cache.json
+.env
+.env.*
+
+# Local verification & debug scripts with real credentials
+tlscheck.mjs
+VERIFY-REPORT.md
+
+# Agent runtime state
+.pi/
+.pi-glla/

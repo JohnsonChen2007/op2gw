@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>op2gw · 调试控制台</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">op2gw</span>
+    <span class="tagline">OpenCode Zen 免费网关 · OpenAI v1 兼容</span>
+  </div>
+  <div class="status-chips" id="statusChips">
+    <span class="chip" id="chipHealth">连接中…</span>
+    <span class="chip" id="chipPool"></span>
+    <span class="chip" id="chipModels"></span>
+    <span class="chip" id="chipProxy"></span>
+    <span class="chip" id="chipUptime"></span>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="overview">概览</button>
+  <button class="tab" data-tab="models">模型</button>
+  <button class="tab" data-tab="pool">IP 池</button>
+  <button class="tab" data-tab="logs">日志</button>
+  <button class="tab" data-tab="traces">请求</button>
+  <button class="tab" data-tab="playground">调试台</button>
+  <button class="tab" data-tab="settings">设置</button>
+</nav>
+
+<main>
+  <!-- Overview -->
+  <section class="panel active" id="tab-overview">
+    <div class="grid">
+      <div class="card"><div class="k">网关版本</div><div class="v" id="ovVersion">—</div></div>
+      <div class="card"><div class="k">运行时长</div><div class="v" id="ovUptime">—</div></div>
+      <div class="card"><div class="k">目录状态</div><div class="v" id="ovCatalog">—</div></div>
+      <div class="card"><div class="k">暴露模型</div><div class="v" id="ovExposed">—</div></div>
+      <div class="card"><div class="k">IP 池</div><div class="v" id="ovPool">—</div></div>
+      <div class="card"><div class="k">出口数</div><div class="v" id="ovExits">—</div></div>
+    </div>
+    <div class="card wide">
+      <h3>接入方式</h3>
+      <p class="muted">任何 OpenAI 兼容工具（opencode / curl / SDK）把 base URL 指向下面地址即可，模型走 OpenCode Zen 免费匿名通道。</p>
+      <pre id="baseUrlBox">base_url = http://127.0.0.1:8787/v1
+api_key  = (留空，或配置的网关密钥)</pre>
+      <div class="row">
+        <button class="btn" id="btnRefreshCatalog">强制刷新目录</button>
+        <button class="btn" id="btnRefreshPool">刷新 IP 池</button>
+        <span id="ovMsg" class="muted"></span>
+      </div>
+    </div>
+    <div class="card wide">
+      <h3>最近错误 / 目录</h3>
+      <pre id="ovError" class="small">—</pre>
+    </div>
+  </section>
+
+  <!-- Models -->
+  <section class="panel" id="tab-models">
+    <div class="toolbar">
+      <input type="search" id="modelFilter" placeholder="筛选模型 id…">
+      <button class="btn" id="btnReloadModels">刷新</button>
+    </div>
+    <table class="data">
+      <thead><tr><th>模型 id</th><th>判定来源</th><th>上下文</th><th>最大输出</th><th>推理</th></tr></thead>
+      <tbody id="modelRows"></tbody>
+    </table>
+  </section>
+
+  <!-- Pool -->
+  <section class="panel" id="tab-pool">
+    <div class="card wide">
+      <h3>添加出口代理</h3>
+      <div class="exit-form">
+        <div class="exit-form-grid">
+          <div class="ef-field ef-scheme">
+            <label>类型</label>
+            <select id="exitScheme" class="sel">
+              <option value="http" selected>http</option>
+              <option value="socks5">socks5</option>
+            </select>
+          </div>
+          <div class="ef-field ef-host">
+            <label>主机 / IP</label>
+            <input type="text" id="exitHost" placeholder="proxy.example.com 或 198.51.100.1" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="ef-field ef-port">
+            <label>端口</label>
+            <input type="text" id="exitPort" inputmode="numeric" placeholder="10808" autocomplete="off">
+          </div>
+        </div>
+        <div class="exit-form-grid">
+          <div class="ef-field ef-user">
+            <label>用户名（可选）</label>
+            <input type="text" id="exitUser" placeholder="无认证则留空" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="ef-field ef-pass">
+            <label>密码（可选）</label>
+            <input type="password" id="exitPass" placeholder="无认证则留空" autocomplete="new-password">
+          </div>
+          <div class="ef-field ef-showpass">
+            <label class="check"><input type="checkbox" id="exitShowPass"> 显示</label>
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn primary" id="btnAddExit">添加</button>
+          <button class="btn" id="btnParseExitUri" type="button">从 URI 解析填充</button>
+          <input type="text" id="exitUri" class="ef-uri" placeholder="也可整条粘贴 http://user:pass@host:port，点「解析填充」">
+          <span id="poolMsg" class="muted"></span>
+        </div>
+        <p class="muted small" id="exitPreview">填写后自动预览。加密机场节点（vmess/vless 等）需外部 sing-box，超出内置拨号范围。凭据仅保存在本机配置文件中。</p>
+      </div>
+    </div>
+    <table class="data">
+      <thead><tr><th>出口 id</th><th>类型</th><th>来源</th><th>出口 IP</th><th>状态</th><th>延迟</th><th>操作</th></tr></thead>
+      <tbody id="exitRows"></tbody>
+    </table>
+    <div class="card wide">
+      <h3>免费源</h3>
+      <table class="data compact">
+        <thead><tr><th>URL</th><th>产出</th><th>连续失败</th><th>最近错误</th></tr></thead>
+        <tbody id="sourceRows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Logs -->
+  <section class="panel" id="tab-logs">
+    <div class="toolbar">
+      <select id="logLevel">
+        <option value="debug">debug</option>
+        <option value="info" selected>info</option>
+        <option value="warn">warn</option>
+        <option value="error">error</option>
+      </select>
+      <button class="btn" id="btnSetLevel">应用级别</button>
+      <label class="check"><input type="checkbox" id="logFollow" checked> 实时跟随</button></label>
+      <button class="btn" id="btnClearLogs">清屏</button>
+    </div>
+    <div id="logView" class="logview"></div>
+  </section>
+
+  <!-- Traces -->
+  <section class="panel" id="tab-traces">
+    <div class="toolbar"><button class="btn" id="btnReloadTraces">刷新</button></div>
+    <table class="data">
+      <thead><tr><th>时间</th><th>模型</th><th>流式</th><th>状态</th><th>出口</th><th>尝试</th><th>耗时</th><th>结果</th></tr></thead>
+      <tbody id="traceRows"></tbody>
+    </table>
+  </section>
+
+  <!-- Playground -->
+  <section class="panel" id="tab-playground">
+    <div class="pg-grid">
+      <div class="pg-left">
+        <label>模型 <select id="pgModel"></select></label>
+        <label>API
+          <select id="pgApi">
+            <option value="chat">chat/completions</option>
+            <option value="responses">responses</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="pgStream" checked> 流式</label>
+        <label>System<textarea id="pgSystem" rows="2" placeholder="可选"></textarea></label>
+        <label>User<textarea id="pgUser" rows="6">用一句话介绍你自己。</textarea></label>
+        <button class="btn primary" id="btnSend">发送</button>
+        <span id="pgMsg" class="muted"></span>
+      </div>
+      <div class="pg-right">
+        <h3>响应</h3>
+        <pre id="pgOut" class="output"></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- Settings (omniroute-style) -->
+  <section class="panel" id="tab-settings">
+    <div class="settings-wrap">
+      <!-- Server -->
+      <div class="set-card">
+        <div class="set-head"><span class="set-icon">🖧</span><div><h3>服务器</h3><p class="muted small">监听地址与端口。修改后需重启进程生效。</p></div></div>
+        <div class="set-body">
+          <div class="field"><label>监听地址</label><input type="text" id="setHost" placeholder="127.0.0.1"></div>
+          <div class="field"><label>端口</label><input type="text" id="setPort" placeholder="8787"></div>
+          <div class="field"><label>目录刷新间隔（秒）</label><input type="text" id="setRefresh" placeholder="300"></div>
+        </div>
+      </div>
+
+      <!-- Proxy -->
+      <div class="set-card">
+        <div class="set-head"><span class="set-icon">🌐</span><div><h3>网络代理</h3><p class="muted small">默认出口代理，所有上游请求经此发出。留空为直连。即时生效，无需重启。</p></div></div>
+        <div class="set-body">
+          <div class="field wide">
+            <label>代理地址</label>
+            <input type="text" id="setProxy" placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+          </div>
+          <div class="proxy-actions">
+            <button class="btn" id="btnUseEnvProxy">使用系统检测到的代理</button>
+            <button class="btn" id="btnClearProxy">清空（直连）</button>
+            <button class="btn" id="btnTestProxy">测试代理连通性</button>
+          </div>
+          <div class="field"><span class="muted small" id="envProxyHint"></span></div>
+          <pre id="proxyTestOut" class="small" style="display:none"></pre>
+        </div>
+      </div>
+
+      <!-- Proxy pool -->
+      <div class="set-card">
+        <div class="set-head"><span class="set-icon">🧊</span><div><h3>代理池</h3><p class="muted small">持久化在配置文件中的出口代理列表（支持用户名:密码认证，http 与 socks5）。点「设为默认」把它作为全局默认出口；默认代理行会高亮标记。</p></div></div>
+        <div class="set-body">
+          <table class="data compact" id="poolTable" style="width:100%">
+            <thead><tr><th>代理地址</th><th>状态</th><th>延迟</th><th>操作</th></tr></thead>
+            <tbody id="poolRows"><tr><td colspan="4" class="muted">加载中…</td></tr></tbody>
+          </table>
+          <div class="row" style="margin-top:10px">
+            <select id="poolScheme" class="sel">
+              <option value="http">http://</option>
+              <option value="socks5">socks5://</option>
+            </select>
+            <input type="text" id="poolHost" placeholder="host:port（如 198.51.100.1:10808）" style="flex:1.2">
+            <input type="text" id="poolUser" placeholder="用户名（可留空）">
+            <input type="password" id="poolPass" placeholder="密码（可留空）">
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button class="btn" id="btnAddPoolProxy">添加到代理池</button>
+            <label class="check"><input type="checkbox" id="poolMakeDefault"> 同时设为默认代理</label>
+            <span class="muted small" id="poolMsg"></span>
+          </div>
+          <div class="field"><span class="muted small" id="poolHint"></span></div>
+        </div>
+      </div>
+
+      <!-- Runtime -->
+      <div class="set-card">
+        <div class="set-head"><span class="set-icon">🎚️</span><div><h3>运行时</h3><p class="muted small">日志级别即时生效。</p></div></div>
+        <div class="set-body">
+          <div class="field">
+            <label>日志级别</label>
+            <select id="setLogLevel">
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warn">warn</option>
+              <option value="error">error</option>
+            </select>
+          </div>
+          <div class="field"><label>IP 池</label><span class="muted small" id="setPoolHint">—</span></div>
+        </div>
+      </div>
+
+      <!-- Security -->
+      <div class="set-card">
+        <div class="set-head"><span class="set-icon">🔑</span><div><h3>访问密钥</h3><p class="muted small">留空 = loopback 开放。设置后客户端需带 <code>Authorization: Bearer &lt;key&gt;</code>。多个用逗号分隔。</p></div></div>
+        <div class="set-body">
+          <div class="field wide">
+            <label>网关 API Key</label>
+            <input type="text" id="setApiKeys" placeholder="key1,key2（留空为开放）">
+          </div>
+        </div>
+      </div>
+
+      <div class="set-footer">
+        <button class="btn primary" id="btnSaveSettings">保存配置</button>
+        <span class="muted" id="setMsg"></span>
+        <span class="muted small" id="setPath"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
