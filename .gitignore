@@ -3,6 +3,9 @@ node_modules/
 
 # Build artifacts
 dist/
+dist-pack/
+op2gw-*.zip
+op2gw-*.tar.gz
 
 # Logs & temp files
 *.log

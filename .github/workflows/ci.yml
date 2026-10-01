@@ -15,5 +15,26 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      # typecheck + build + the full offline unit suite (129 tests, no network).
+      # typecheck + build + the full offline unit suite (no network).
       - run: npm run ci
+
+  # Pack only tracked files via `git archive` (see scripts/pack-source.mjs),
+  # so local secrets (~/.op2gw/config.json, .env, untracked media)
+  # can never leak into the artifact.
+  package:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build source archives from tracked files
+        run: npm run pack:source && ls -lh dist-pack/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: op2gw-source-${{ github.sha }}
+          path: |
+            dist-pack/op2gw-*.zip
+            dist-pack/op2gw-*.tar.gz
+          retention-days: 30
