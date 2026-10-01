@@ -127,15 +127,21 @@ test('prober tick marks an unreachable free exit dead and evicts it past the thr
   }
 })
 
-test('prober never evicts a failing manual exit (probe is advisory for user exits)', async () => {
+test('a failed multi-site probe round kills a manual exit but never evicts it', async () => {
   const pool = new ExitPool({ deadRecheckMs: 0, deadEvictions: 1 })
   pool.add(node('http://manual:1', { source: 'manual' }))
   const cache = new DispatcherCache()
   const prober = new Prober(pool, cache, quietLogger(), { fetchIp: async () => null })
   try {
     await prober.tick()
-    assert.equal(pool.has('http://manual:1'), true, 'user-asserted exits survive probe failures')
-    assert.equal(pool.isUsable('http://manual:1', 'm'), true, 'still usable (unknown, not dead)')
+    assert.equal(pool.has('http://manual:1'), true, 'user-asserted exits are never evicted')
+    assert.equal(pool.isUsable('http://manual:1', 'm'), false, 'the dead verdict comes from the verified probe round')
+    // On-demand recovery (pool starved): a forced round re-verifies dead
+    // exits regardless of the recheck schedule and revives them on success.
+    const okProber = new Prober(pool, cache, quietLogger(), { fetchIp: async () => ({ ip: '1.2.3.4', latencyMs: 10 }) })
+    await okProber.tick(true)
+    okProber.stop()
+    assert.equal(pool.isUsable('http://manual:1', 'm'), true, 'forced verification revives a healthy exit')
   } finally {
     prober.stop()
     await cache.destroy()
