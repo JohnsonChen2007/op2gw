@@ -19,6 +19,10 @@ interface ExitHealth {
   state: ExitState
   lastProbedAt: number
   cooldownUntil: number
+  /** Why the current cooldown was raised: 'limited' (429 quota backoff — must
+   *  never be cleared by a reachability probe) vs 'transport' (connectivity —
+   *  a successful multi-site probe clears it immediately). */
+  cooldownReason: 'limited' | 'transport'
   consecutiveLimited: number
   deadStrikes: number
   inflight: boolean
@@ -136,6 +140,7 @@ export class ExitPool {
         state: 'unknown',
         lastProbedAt: 0,
         cooldownUntil: 0,
+        cooldownReason: 'limited',
         consecutiveLimited: 0,
         deadStrikes: 0,
         inflight: false,
@@ -303,13 +308,21 @@ export class ExitPool {
         // Exponential-ish cooldown capped at 10x base.
         const factor = Math.min(2 ** (health.consecutiveLimited - 1), 10)
         health.cooldownUntil = now + this.#cooldownMs * factor
+        health.cooldownReason = 'limited'
         break
       }
       case 'transport': {
-        // A genuine connectivity failure (connect refused, DNS, tunnel drop)
-        // is the exit's fault -> mark dead; the prober revives it later.
+        // A transport failure on the request path is NOT a death sentence: it
+        // is often a hung keep-alive or a transient tunnel stall while the
+        // proxy itself is fine (observed 2026-10-01: two healthy exits marked
+        // dead on one 10s connect timeout each, stranding the whole pool).
+        // Cool the exit briefly and downgrade to 'unknown' so the prober's
+        // multi-site verification (Google/YouTube/egress-IP) owns the dead
+        // verdict. A probe that stands up revives the exit immediately.
         health.deadStrikes += 1
-        health.state = 'dead'
+        health.cooldownUntil = now + this.#cooldownMs
+        health.cooldownReason = 'transport'
+        if (health.state === 'ok') health.state = 'unknown'
         break
       }
       case 'server': {
@@ -351,7 +364,14 @@ export class ExitPool {
     this.#banModel(exitId, model, true)
   }
 
-  /** Update health after a probe (prober drives this). */
+  /** Update health after a probe (prober drives this).
+   *
+   *  A probe round is MULTI-SITE reachability verification (Google 204,
+   *  YouTube, egress-IP echo): any one site answering proves the tunnel
+   *  stands, and a round where every site fails is the sanctioned way to
+   *  mark an exit dead. Request-path transport failures never do that on
+   *  their own (see markFailure) — they only cool the exit and hand it to
+   *  the prober for verification. */
   markProbe(exitId: string, ok: boolean, latencyMs: number, exitIP?: string, location?: string): void {
     const node = this.#exits.get(exitId)
     const health = this.#health.get(exitId)
@@ -361,19 +381,21 @@ export class ExitPool {
     if (ok) {
       health.state = 'ok'
       health.deadStrikes = 0
+      // Reachability proven: lift a transport cooldown. A 429 backoff is a
+      // quota verdict, not a reachability one, and survives the probe.
+      if (health.cooldownReason === 'transport') {
+        health.cooldownUntil = 0
+        health.consecutiveLimited = 0
+      }
       node.latencyMs = latencyMs
       if (exitIP) node.exitIP = exitIP
       if (location) node.location = location
     } else {
-      // A probe is an auxiliary reachability hint (it fetches the egress IP for
-      // display/routing), NOT the source of truth for a user-asserted exit. The
-      // egress probe endpoint (ipify) is itself flaky through some tunnels, and
-      // a false "dead" on the only manual exit strands the whole gateway. So a
-      // probe failure never marks a manual/pinned exit dead — real request
-      // outcomes (markFailure 'transport') still can. It only downgrades to
-      // 'unknown', which isUsable() still treats as usable.
       health.deadStrikes += 1
-      if (node.source === 'manual' || node.pinned) {
+      if (node.pinned) {
+        // An operator pinned this exit deliberately; a failed round only
+        // downgrades it so requests rotate away while it keeps its place
+        // (and revives on the next successful verification).
         if (health.state === 'ok') health.state = 'unknown'
       } else {
         health.state = 'dead'
@@ -381,9 +403,12 @@ export class ExitPool {
     }
   }
 
-  /** Exits that should be re-probed (dead past recheck window, or never
-   *  probed). Marks them inflight to serialize per-exit probes. */
-  dueForProbe(): ExitNode[] {
+  /** Exits that should be probed. Normally that is 'unknown' exits plus
+   *  'dead' exits past the recheck window. `forceAll` (on-demand recovery
+   *  when the pool is starved) verifies every non-direct exit regardless of
+   *  schedule so a tunnel that just came back is not held dead for another
+   *  recheck window. Marks them inflight to serialize per-exit probes. */
+  dueForProbe(forceAll = false): ExitNode[] {
     const now = this.#now()
     const due: ExitNode[] = []
     for (const node of this.#exits.values()) {
@@ -391,7 +416,7 @@ export class ExitPool {
       const health = this.#health.get(node.id)!
       if (health.inflight) continue
       const overdue = now - health.lastProbedAt > this.#deadRecheckMs
-      if (health.state === 'unknown' || (health.state === 'dead' && overdue)) {
+      if (forceAll || health.state === 'unknown' || (health.state === 'dead' && overdue)) {
         health.inflight = true
         due.push(node)
       }

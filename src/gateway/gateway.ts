@@ -13,6 +13,7 @@ import {
   chatToResponsesCompletion,
   chatToResponsesStream,
   isResponsesWireModel,
+  normalizeChatToolCallIds,
   resolveUpstreamApi,
   responsesToChatBody,
   responsesToChatCompletion,
@@ -49,6 +50,14 @@ export interface GatewayDeps {
    * the operator's real country/IP can never leak upstream.
    */
   directAllowed?: boolean
+  /**
+   * Fired when the pool cannot yield any exit for a request (every exit is
+   * cooling/dead/banned, or direct is sealed). The runtime wires this to an
+   * immediate full verification round so a tunnel that has quietly come back
+   * is revived for the NEXT request instead of waiting for the scheduled
+   * probe interval / dead-exit recheck window.
+   */
+  onPoolStarved?: () => void
 }
 
 export interface GatewayRequest {
@@ -126,6 +135,10 @@ export class Gateway {
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const exit = this.#pickExit(model, ids.session, triedExits)
       if (!exit) {
+        // Nobody is usable right now: ask the prober to verify every exit
+        // immediately (multi-site) so the next request can route again as
+        // soon as a tunnel is truly back.
+        this.#d.onPoolStarved?.()
         if (triedExits.size > 0 && lastError) {
           break
         }
@@ -208,6 +221,12 @@ export class Gateway {
         }
         story.push(`#${attempt} ${exit.id} ${kind}: ${(err as Error).message.slice(0, 80)}`)
         log.warn('attempt failed', { model, exit: exit.id, attempt, kind, error: (err as Error).message })
+        if (status === 400) {
+          // Surface WHICH tool binding the provider rejected without logging
+          // prompt content — the recurring 2026-10-01 400s rotated identically
+          // across exits, so the wire body itself was the failing suspect.
+          log.warn('upstream 400 wire-body shape', { model, tools: toolShapeSummary(wireBody) })
+        }
         // Non-retryable statuses (400) surface immediately; we keep rotating within
         // budget on exit-shaped failures only.
         const rotatable = status !== 400 && (kind === 'limited' || kind === 'transport' || kind === 'server' || kind === 'refused' || kind === 'region')
@@ -331,7 +350,8 @@ export class Gateway {
     void wireApi
   }
 
-  /** Translate the client body to the wire dialect, then apply the free-lane gate. */
+  /** Translate the client body to the wire dialect, then apply the free-lane
+   *  gate and normalize the tool-call bindings the provider validates. */
   #prepareBody(wireApi: UpstreamApi, clientApi: UpstreamApi, body: Record<string, unknown>): unknown {
     if (wireApi === 'responses') {
       const translated = clientApi === 'chat' ? chatToResponsesBody(body) : body
@@ -340,7 +360,7 @@ export class Gateway {
     }
     const translated = clientApi === 'responses' ? responsesToChatBody(body) : body
     const { body: shaped } = ensureChatFreeLaneShape(translated)
-    return shaped
+    return normalizeChatToolCallIds(shaped as Record<string, unknown>)
   }
 
   /** Wire SSE stream -> client dialect (identity when both dialects match). */
@@ -382,6 +402,35 @@ export class GatewayHttpError extends Error {
   toOpenAIBody(): string {
     return JSON.stringify({ error: { message: this.message, type: this.type, code: null } })
   }
+}
+
+/**
+ * A compact, content-free summary of the tool-call bindings in the wire body:
+ * one entry per INVALID binding (missing / empty / non-string id on a tool
+ * message, or a missing id on an assistant tool_calls entry). An empty array
+ * means every binding is well-formed, so a 400 came from something else.
+ */
+function toolShapeSummary(body: unknown): Record<string, unknown>[] {
+  const msgs = isRecord(body) && Array.isArray(body.messages) ? (body.messages as unknown[]) : []
+  const bad: Record<string, unknown>[] = []
+  msgs.forEach((raw, i) => {
+    if (!isRecord(raw)) return
+    const role = typeof raw.role === 'string' ? raw.role : ''
+    if (role === 'tool') {
+      const id = raw.tool_call_id
+      if (!(typeof id === 'string' && id.length > 0)) {
+        bad.push({ i, kind: 'tool', id: id === '' ? 'empty' : typeof id })
+      }
+      return
+    }
+    if (role === 'assistant' && Array.isArray(raw.tool_calls)) {
+      raw.tool_calls.forEach((rawCall, j) => {
+        const cid = isRecord(rawCall) ? rawCall.id : undefined
+        if (!(typeof cid === 'string' && cid.length > 0)) bad.push({ i, j, kind: 'assistant.tool_calls', id: cid === '' ? 'empty' : typeof cid })
+      })
+    }
+  })
+  return bad
 }
 
 function extractMessages(body: Record<string, unknown>): Array<{ role: string; content: unknown }> {
