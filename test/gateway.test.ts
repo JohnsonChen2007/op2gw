@@ -119,7 +119,13 @@ interface GatewayHarness {
 
 function makeGateway(
   zenBaseUrl: string,
-  opts: { poolEnabled: boolean; exits?: string[]; maxRotateAttempts?: number; freeModels?: string[] } = { poolEnabled: false },
+  opts: {
+    poolEnabled: boolean
+    exits?: string[]
+    maxRotateAttempts?: number
+    freeModels?: string[]
+    onPoolStarved?: () => void
+  } = { poolEnabled: false },
 ): GatewayHarness {
   const logger = new Logger({ level: 'error', stdout: false, capacity: 50, traceCapacity: 50 })
   const pool = new ExitPool()
@@ -154,6 +160,7 @@ function makeGateway(
     zenBaseUrl,
     maxRotateAttempts: opts.maxRotateAttempts ?? 3,
     poolEnabled: opts.poolEnabled,
+    onPoolStarved: opts.onPoolStarved,
   })
   const cleanup = async (): Promise<void> => {
     await dispatchers.destroy().catch(() => {})
@@ -320,4 +327,46 @@ test('serves a chat client from a responses-wire model via transcode', async () 
   const names = (wire.tools ?? []).map((t) => t.name)
   assert.ok(names.includes('bash') && names.includes('read'), 'responses gate tools injected')
   assert.equal(wire.tool_choice, 'auto')
+})
+
+test('backfills a missing tool_call_id before forwarding on the chat wire', async () => {
+  const { url, seen } = await startZen((_seen, res) => sse(200, chatSse(CHAT_MODEL, 'Hello'), res))
+  const { gateway } = makeGateway(url)
+  const result = await gateway.handle({
+    api: 'chat',
+    body: {
+      model: CHAT_MODEL,
+      messages: [
+        { role: 'user', content: 'ls' },
+        { role: 'assistant', content: null, tool_calls: [{ id: 'call_x1', type: 'function', function: { name: 'bash', arguments: '{}' } }] },
+        { role: 'tool', call_id: 'call_x1', content: 'file1' },
+      ],
+    },
+    clientStream: true,
+  })
+  assert.equal(result.status, 200)
+  await collect(result.body)
+  assert.equal(seen.length, 1)
+  const wire = seen[0]?.body as { messages: Array<Record<string, unknown>> }
+  assert.equal(wire.messages[2]?.tool_call_id, 'call_x1', 'call_id spelling normalized to tool_call_id')
+})
+
+test('starved pool fires the on-demand verification kick and refuses with 503', async () => {
+  const { url } = await startZen((_seen, res) => sse(200, chatSse(CHAT_MODEL, 'x'), res))
+  let kicks = 0
+  const { gateway, pool } = makeGateway(url, {
+    poolEnabled: true,
+    exits: ['http://exit-a:1', 'http://exit-b:1'],
+    onPoolStarved: () => {
+      kicks += 1
+    },
+  })
+  // Both exits dead (verified unreachable): the pick starves immediately.
+  pool.markProbe('http://exit-a:1', false, 0)
+  pool.markProbe('http://exit-b:1', false, 0)
+  await assert.rejects(
+    gateway.handle({ api: 'chat', body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] }, clientStream: true }),
+    (err: unknown) => err instanceof GatewayHttpError && err.status === 503,
+  )
+  assert.ok(kicks >= 1, 'pool starvation triggers an immediate re-verification round')
 })
