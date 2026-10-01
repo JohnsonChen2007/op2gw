@@ -391,7 +391,7 @@ export class ExitPool {
       const health = this.#health.get(node.id)!
       if (health.inflight) continue
       const overdue = now - health.lastProbedAt > this.#deadRecheckMs
-      if (health.state === 'unknown' || (health.state === 'dead' && overdue) || overdue) {
+      if (health.state === 'unknown' || (health.state === 'dead' && overdue)) {
         health.inflight = true
         due.push(node)
       }
