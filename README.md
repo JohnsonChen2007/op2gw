@@ -2,6 +2,10 @@
 
 # op2gw
 
+视频介绍看B站：
+https://www.bilibili.com/video/BV11hYw6vEx4/?spm_id_from=333.1387.homepage.video_card.click&vd_source=9073f486417417fcfc08a185bc6ad90e
+
+
 **面向 OpenCode Zen 免费通道的独立 OpenAI v1 兼容网关**
 
 一键启动 · 免 API key · 多出口 IP 池 · 结构化日志 · 自我修复 · 内置调试网页
