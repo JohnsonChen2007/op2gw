@@ -377,7 +377,7 @@ export class ModelCatalog {
       updatedAt: number
       prices: Array<[string, ModelPrice]>
     }
-    if (Date.now() - raw.updatedAt > 7 * METADATA_REFRESH_MS) throw new Error('cache too old')
+    if (this.#now() - raw.updatedAt > 7 * METADATA_REFRESH_MS) throw new Error('cache too old')
     return new Map(raw.prices)
   }
 }

@@ -127,6 +127,11 @@ export class Runtime {
       maxRotateAttempts: config.pool.maxRotateAttempts,
       poolEnabled: config.pool.enabled,
       directAllowed: config.pool.includeDirect,
+      // Refusing a request is also a recovery signal: verify every exit right
+      // now (multi-site) instead of waiting for the scheduled probe rounds.
+      onPoolStarved: () => {
+        if (this.#prober) void this.#prober.tick(true)
+      },
     })
 
     this.#selfHealer = new SelfHealer({

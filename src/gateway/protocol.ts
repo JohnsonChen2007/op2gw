@@ -108,6 +108,108 @@ function responsesEffortOf(body: Json): string | undefined {
 // ---------------------------------------------------------------------------
 
 /**
+ * Backfill every `role: "tool"` message's `tool_call_id` before the body leaves
+ * for the chat wire.
+ *
+ * The provider behind Zen rejects a tool message whose `tool_call_id` is
+ * absent with `[400] messages[N]: tool messages must include a non-empty
+ * string tool_call_id`, and every request-path rotation then fails identically
+ * (observed 2026-10-01 across two independent exits — the body, not the
+ * exits, was wrong). Clients are sloppy in three distinct ways, all handled
+ * here:
+ *
+ *   1. the field is present but spelled `call_id` (Responses-style naming on
+ *      the chat surface);
+ *   2. the field is missing or empty — pair positionally with the nearest
+ *      preceding assistant `tool_calls` entries that no tool message has
+ *      claimed yet;
+ *   3. an unpaired orphan keeps its (empty) id: Zen tolerates the present-but-
+ *      empty shape, and inventing an id that matches nothing is worse than
+ *      leaving it empty.
+ *
+ * Well-formed bodies are returned by reference (no copy). The function runs
+ * on the WIRE body, so it normalizes chat passthroughs and the output of
+ * every inbound translator (responses, anthropic) in one place.
+ */
+export function normalizeChatToolCallIds(body: Json): Json {
+  const messages = Array.isArray(body.messages) ? (body.messages as unknown[]) : null
+  if (!messages) return body
+  const pending: string[] = [] // unclaimed assistant tool_call ids, FIFO
+  let changed = false
+  const out: unknown[] = []
+  let synthesized = 0
+  for (const raw of messages) {
+    if (!isRecord(raw)) {
+      out.push(raw)
+      continue
+    }
+    const msg = raw
+    const role = typeof msg.role === 'string' ? msg.role : ''
+    if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
+      // An assistant call entry without an id makes the whole tool round
+      // invalid on the provider side even when every tool message carries an
+      // id — synthesize one and queue it so the matching result pairs to it.
+      let callsChanged = false
+      const calls = msg.tool_calls.map((rawCall) => {
+        if (!isRecord(rawCall)) return rawCall
+        const call = rawCall
+        if (typeof call.id === 'string' && call.id.length > 0) {
+          pending.push(call.id)
+          return call
+        }
+        const id = `op2gw_call_${synthesized++}`
+        pending.push(id)
+        callsChanged = true
+        return { ...call, id }
+      })
+      if (callsChanged) {
+        changed = true
+        out.push({ ...msg, tool_calls: calls })
+      } else {
+        out.push(msg)
+      }
+      continue
+    }
+    if (role !== 'tool') {
+      out.push(msg)
+      continue
+    }
+    const declared =
+      typeof msg.tool_call_id === 'string' && msg.tool_call_id.length > 0
+        ? msg.tool_call_id
+        : typeof msg.call_id === 'string' && msg.call_id.length > 0
+          ? msg.call_id
+          : ''
+    if (declared) {
+      const at = pending.indexOf(declared)
+      if (at >= 0) pending.splice(at, 1)
+      if (msg.tool_call_id !== declared) {
+        changed = true
+        out.push({ ...msg, tool_call_id: declared })
+      } else {
+        out.push(msg)
+      }
+      continue
+    }
+    const paired = pending.shift()
+    if (paired !== undefined && paired !== '') {
+      changed = true
+      out.push({ ...msg, tool_call_id: paired })
+    } else {
+      // Unpaired: Zen accepts the present-but-empty shape. Only rewrite when
+      // the field is absent, so a genuinely-empty id is left byte-identical.
+      if (typeof msg.tool_call_id !== 'string') {
+        changed = true
+        out.push({ ...msg, tool_call_id: '' })
+      } else {
+        out.push(msg)
+      }
+    }
+  }
+  return changed ? { ...body, messages: out } : body
+}
+
+/**
  * chat body -> responses body. Produces a well-formed `input` array so the
  * responses free-lane gate (which requires an array) can inject its tools.
  *
@@ -127,6 +229,9 @@ export function chatToResponsesBody(body: Json): Json {
   const messages = Array.isArray(body.messages) ? (body.messages as unknown[]) : []
   const instructions: string[] = []
   const input: Json[] = []
+  // Unclaimed function_call ids so an output whose tool_call_id is missing or
+  // spelled differently still binds to the right call instead of 'call_0'.
+  const pendingCallIds: string[] = []
 
   for (const m of messages) {
     const msg = isRecord(m) ? m : {}
@@ -138,9 +243,18 @@ export function chatToResponsesBody(body: Json): Json {
       continue
     }
     if (role === 'tool') {
+      const declared =
+        typeof msg.tool_call_id === 'string' && msg.tool_call_id.length > 0
+          ? msg.tool_call_id
+          : typeof msg.call_id === 'string' && msg.call_id.length > 0
+            ? msg.call_id
+            : ''
+      const callId = declared || pendingCallIds.shift() || 'call_0'
+      const at = pendingCallIds.indexOf(callId)
+      if (at >= 0) pendingCallIds.splice(at, 1)
       input.push({
         type: 'function_call_output',
-        call_id: String(msg.tool_call_id ?? msg.call_id ?? 'call_0'),
+        call_id: callId,
         output: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? ''),
       })
       continue
@@ -153,9 +267,11 @@ export function chatToResponsesBody(body: Json): Json {
       for (const call of msg.tool_calls) {
         if (!isRecord(call)) continue
         const fn = isRecord(call.function) ? call.function : {}
+        const callId = String(call.id ?? 'call_0')
+        pendingCallIds.push(callId)
         input.push({
           type: 'function_call',
-          call_id: String(call.id ?? 'call_0'),
+          call_id: callId,
           name: String(fn.name ?? ''),
           arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? ''),
         })

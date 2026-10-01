@@ -67,12 +67,30 @@ test('limited failure cools the exit; cooldown escalates and markSuccess clears 
   assert.equal(pool.isUsable('http://a:1', 'm'), true)
 })
 
-test('transport failure kills the exit; other models are unaffected', () => {
-  const pool = new ExitPool()
+test('transport failure cools the exit for probe verification; it is never marked dead on the request path', () => {
+  let now = 1_000_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
   pool.add(node('http://a:1'))
   pool.markFailure('http://a:1', 'm1', 'transport')
-  assert.equal(pool.isUsable('http://a:1', 'm1'), false)
-  assert.equal(pool.isUsable('http://a:1', 'm2'), false, 'dead is exit-wide')
+  assert.equal(pool.isUsable('http://a:1', 'm1'), false, 'transport failure cools the whole exit')
+  assert.equal(pool.isUsable('http://a:1', 'm2'), false, 'cooling is exit-wide')
+  const view = pool.view().find((e) => e.id === 'http://a:1')
+  assert.equal(view?.state, 'unknown', 'dead verdict belongs to the multi-site prober, not a request-path failure')
+  now += 60_001
+  assert.equal(pool.isUsable('http://a:1', 'm1'), true, 'after the cooldown the exit is retryable (unknown is usable)')
+})
+
+test('a successful probe lifts a transport cooldown but never a 429 backoff', () => {
+  let now = 1_000_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://t:1'))
+  pool.add(node('http://l:1'))
+  pool.markFailure('http://t:1', 'm', 'transport')
+  pool.markProbe('http://t:1', true, 50, '1.2.3.4')
+  assert.equal(pool.isUsable('http://t:1', 'm'), true, 'reachability proven lifts the connectivity cooldown')
+  pool.markFailure('http://l:1', 'm', 'limited')
+  pool.markProbe('http://l:1', true, 50, '5.6.7.8')
+  assert.equal(pool.isUsable('http://l:1', 'm'), false, 'a 429 backoff survives a reachability probe')
 })
 
 test('server error soft-bans the model pairing only after two strikes', () => {
@@ -131,16 +149,26 @@ test('a suspect strike ages out instead of accumulating forever', () => {
   assert.equal(pool.isUsable('http://a:1', 'm'), true, 'a fresh strike starts the count over')
 })
 
-test('probe failure degrades manual exits to unknown but kills free exits', () => {
+test('a failed multi-site probe round kills exits; pinned exits only degrade to unknown', () => {
   const pool = new ExitPool()
   pool.add(node('http://manual:1', { source: 'manual' }))
   pool.add(node('http://free:1', { source: 'free' }))
-  pool.markProbe('http://manual:1', true, 50, '1.2.3.4')
-  pool.markProbe('http://free:1', true, 60, '5.6.7.8')
-  pool.markProbe('http://manual:1', false, 0)
-  pool.markProbe('http://free:1', false, 0)
-  assert.equal(pool.isUsable('http://manual:1', 'm'), true, 'manual stays usable (unknown)')
+  pool.add(node('http://pinned:1', { source: 'manual', pinned: true }))
+  pool.setPinned('http://pinned:1')
+  for (const id of ['http://manual:1', 'http://free:1', 'http://pinned:1']) {
+    pool.markProbe(id, true, 50, '1.2.3.4')
+  }
+  for (const id of ['http://manual:1', 'http://free:1', 'http://pinned:1']) {
+    pool.markProbe(id, false, 0)
+  }
+  // A dead verdict now requires every probe site (Google/YouTube/egress-IP)
+  // to be unreachable, so it is trusted for operator-added exits too.
+  assert.equal(pool.isUsable('http://manual:1', 'm'), false, 'manual exit marked dead')
   assert.equal(pool.isUsable('http://free:1', 'm'), false, 'free exit marked dead')
+  assert.equal(pool.isUsable('http://pinned:1', 'm'), true, 'pinned stays usable (unknown)')
+  // A later successful round revives them.
+  pool.markProbe('http://manual:1', true, 55, '1.2.3.4')
+  assert.equal(pool.isUsable('http://manual:1', 'm'), true, 'verification success revives the exit')
 })
 
 test('evictDead spares manual and pinned exits', () => {
@@ -149,14 +177,30 @@ test('evictDead spares manual and pinned exits', () => {
   pool.add(node('http://pinned:1', { source: 'manual', pinned: true }))
   pool.add(node('http://free:1', { source: 'free' }))
   pool.setPinned('http://pinned:1')
-  for (const id of ['http://manual:1', 'http://pinned:1', 'http://free:1']) {
-    pool.markFailure(id, 'm', 'transport')
-    pool.markFailure(id, 'm', 'transport')
-  }
+  // Dead via the sanctioned path: failed verification rounds.
+  pool.markProbe('http://manual:1', false, 0)
+  pool.markProbe('http://manual:1', false, 0)
+  pool.markProbe('http://pinned:1', false, 0)
+  pool.markProbe('http://free:1', false, 0)
+  pool.markProbe('http://free:1', false, 0)
   const evicted = pool.evictDead()
   assert.deepEqual(evicted, ['http://free:1'])
   assert.equal(pool.has('http://manual:1'), true)
   assert.equal(pool.has('http://pinned:1'), true)
+})
+
+test('dueForProbe(forceAll) verifies every non-direct exit regardless of schedule', () => {
+  let now = 1_000_000
+  const pool = new ExitPool({ deadRecheckMs: 5 * 60_000, now: () => now })
+  pool.add(node('http://ok:1'))
+  pool.add(node('http://dead:1'))
+  pool.markProbe('http://ok:1', true, 40, '1.1.1.1')
+  pool.markProbe('http://dead:1', true, 40, '2.2.2.2')
+  pool.markProbe('http://dead:1', false, 0) // failed verification round -> dead
+  // 'ok' is never due; 'dead' only past the recheck window.
+  assert.equal(pool.dueForProbe().length, 0, 'nothing is due on schedule')
+  const forced = pool.dueForProbe(true)
+  assert.deepEqual(forced.map((n) => n.id).sort(), ['http://dead:1', 'http://ok:1'])
 })
 
 test('pick prefers sticky, then pinned, then lowest latency', () => {
