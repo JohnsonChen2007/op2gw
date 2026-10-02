@@ -177,7 +177,7 @@ OpenCode Zen 免费层（经实测）有**两道校验，缺一即被 403 拒绝
   - **Tier 2 per-(出口×模型)**：401/403/地区封锁通常是**模型级**（如 muse 的 RegionError），只封禁该「出口×模型」配对，出口服务其他模型不受影响。
 - **选择顺序**：pinned 固定出口 → 会话粘性（同对话粘同出口，保 prompt-cache）→ 最优健康节点（低延迟优先）。
 - **轮换重试**（`gateway/gateway.ts`）：一次客户端请求内，若流在**任何内容落地之前**失败，网关透明换一个健康出口重发（有上限）；一旦有字节流出就停止轮换（已交付的流绝不重放）。
-- **后台探活**（`pool/prober.ts`）：经每个出口的 dispatcher 做小 HTTPS 探测拿真实出口 IP（既是路由键又是展示值），失败标记 dead，长期 dead 的免费节点被淘汰。
+- **后台探活**（`pool/prober.ts`）：多站点可达性验证——先探网关自己的上游 `GET {zen}/v1/models`（出口能服务推理流量即为活），再试 Google 204 / YouTube / ipify（拿真实出口 IP，兼作路由键与展示值）。**任何 HTTP 应答（含 404/429/5xx）都证明隧道可用**，只有传输层错误（连接超时/重置/中止）才算失败——部分代理线路会硬重置 Google/YouTube（实测 2026-10-02：两条远程出口 ~0.3s 内 RST 所有 Google 连接而 opencode.ai 正常），仅靠通用站点判活会把健康出口误杀。全部站点失败才标记 dead；请求路径的传输失败只做短期冷却，死活判定权归探活的异地多站点验证。长期 dead 的免费节点被淘汰，手动出口永不淘汰（可被后续探活复活）。
 - **每出口独立 dispatcher**（`pool/dispatchers.ts`）：direct 用 keep-alive Agent，代理用 ProxyAgent（`pipelining: 0` 规避野代理半开隧道），LRU 缓存防连接池泄漏。
 - **流体空闲看门狗**（`gateway/upstream.ts`）：首字节 30s / 体空闲 120s（responses 300s），防止「隧道建立却永不推流」把请求挂死。
 
@@ -186,6 +186,7 @@ OpenCode Zen 免费层（经实测）有**两道校验，缺一即被 403 拒绝
 - **结构化日志**（`core/logger.ts`）：每条 JSON 行输出到 stdout（error/warn 走 stderr）+ 内存环形缓冲；调试网页经 `/admin/logs/stream`（SSE）实时订阅；日志级别可在运行时热切换。
 - **请求追踪**：每次请求记录出口、出口 IP、状态码、尝试次数、耗时、结果，调试网页「请求」标签页可查。
 - **自我修复看门狗**（`selfheal.ts`）：周期检查——目录过期则强制刷新；direct 出口被误标死亡则复活（保证网关永不「无出口可用」）；池长期无可用出口则告警；写 `~/.op2gw/status.json` 健康快照供外部监控。
+- **外部看门狗**（`scripts/watchdog.sh` + launchd `com.op2gw.watchdog`，60s 一轮）：统计 `logs/op2gw.log` 尾部的**连续错误连击**——`attempt failed`、`level=error`、`pool degraded` 计入，`request ok` 清零，目录刷新告警视为中性；连击 ≥5 且最新错误在 10 分钟内时，执行一次带冷却（默认 10 分钟）的处置：**①更换链路**——把默认出口轮换到次健康的其他池出口（`POST /admin/settings/default-proxy` 热生效并持久化；网关无响应时直改 `~/.op2gw/config.json`）→ **②重启网关**——`launchctl kickstart -k com.op2gw.gateway` → **③更新所有可用的免费模型**——`POST /admin/catalog/refresh` + 全量复探出口。行为可用环境变量调参（阈值/冷却/新鲜度），`OP2GW_WATCHDOG_DRY_RUN=1` 只演练不执行；处置记录写入 `logs/watchdog.log`（健康时静默）。
 
 ---
 
