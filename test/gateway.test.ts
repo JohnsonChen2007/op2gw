@@ -329,6 +329,36 @@ test('serves a chat client from a responses-wire model via transcode', async () 
   assert.equal(wire.tool_choice, 'auto')
 })
 
+test('a responses client echoing prior-turn reasoning never carries it to the wire', async () => {
+  const { url, seen } = await startZen((_seen, res) => sse(200, responsesSse('Hello spark'), res))
+  const { gateway } = makeGateway(url)
+  const result = await gateway.handle({
+    api: 'responses',
+    body: {
+      model: SPARK_MODEL,
+      instructions: 'codex base instructions',
+      input: [
+        { role: 'user', content: 'list files' },
+        { type: 'reasoning', summary: [], encrypted_content: 'gAAAAA minted-by-previous-exit' },
+        { type: 'function_call', call_id: 'call_1', name: 'bash', arguments: '{"cmd":"ls"}' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'a.txt' },
+      ],
+      include: ['reasoning.encrypted_content'],
+      store: false,
+      stream: true,
+    },
+    clientStream: true,
+  })
+  assert.equal(result.status, 200)
+  await collect(result.body)
+  assert.equal(seen.length, 1)
+  const wire = seen[0]?.body as { input?: Array<Record<string, unknown>>; include?: unknown }
+  const types = (wire.input ?? []).map((item) => item.type ?? item.role)
+  assert.ok(!types.includes('reasoning'), 'the encrypted reasoning echo must never reach the wire')
+  assert.deepEqual(types, ['user', 'function_call', 'function_call_output'])
+  assert.equal(wire.include, undefined, 'no include entry asking upstream for new encrypted blobs')
+})
+
 test('backfills a missing tool_call_id before forwarding on the chat wire', async () => {
   const { url, seen } = await startZen((_seen, res) => sse(200, chatSse(CHAT_MODEL, 'Hello'), res))
   const { gateway } = makeGateway(url)
