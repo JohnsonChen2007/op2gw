@@ -114,6 +114,10 @@ export class Runtime {
     this.#prober = config.pool.enabled
       ? new Prober(this.pool, this.dispatchers, this.logger.child('prober'), {
           maxConcurrent: config.pool.maxConcurrentProbes,
+          // Probe the gateway's own upstream models endpoint first: an exit
+          // that can serve inference traffic must never be judged dead by
+          // generic connectivity sites the proxy line happens to block.
+          upstreamUrl: `${config.zenBaseUrl.replace(/\/+$/, '')}/v1/models`,
         })
       : null
 

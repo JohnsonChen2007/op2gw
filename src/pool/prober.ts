@@ -8,14 +8,28 @@ import type { ExitPool } from './pool.js'
 /**
  * Prober — background health/admission checks for exit nodes.
  *
- * A probe round is MULTI-SITE reachability verification, tried in order:
- * Google's connectivity-check endpoint (generate_204), YouTube, then the
- * egress-IP echo (api.ipify.org). ANY one site answering proves the tunnel
- * stands; the round fails (and the pool may mark the exit dead) only when
- * every site is unreachable through that exit. Single-endpoint probing was
- * the old failure mode: ipify hiccuping through one tunnel wrongly killed
- * healthy exits, and one 10s connect timeout on the request path killed the
- * whole pool. Both paths now defer the dead verdict to this verifier.
+ * A probe round is MULTI-SITE reachability verification, tried in order: the
+ * gateway's own upstream (`GET {zen}/v1/models`, the one endpoint this gateway
+ * actually needs), then Google's connectivity-check endpoint (generate_204),
+ * YouTube, and the egress-IP echo (api.ipify.org). ANY one site answering
+ * proves the tunnel stands; the round fails (and the pool may mark the exit
+ * dead) only when every site is unreachable through that exit. Single-endpoint
+ * probing was the old failure mode: ipify hiccuping through one tunnel wrongly
+ * killed healthy exits, and one 10s connect timeout on the request path killed
+ * the whole pool. Both paths now defer the dead verdict to this verifier.
+ *
+ * The upstream target is first because the generic connectivity sites are not
+ * equivalent to "this exit can serve the gateway": some proxy lines hard-reset
+ * google.com/youtube.com (observed 2026-10-02: both remote exits RST every
+ * Google/YouTube connect in ~0.3s while opencode.ai worked fine), so a round
+ * built only from those sites degenerates to ipify — and when ipify is slow or
+ * rate-limited over the shared exit IP, a healthy exit is marked dead and the
+ * pool starves while inference traffic would have succeeded.
+ *
+ * Any HTTP response — 2xx/3xx but equally a 404/429/5xx — counts as "the site
+ * answered": completing TCP+TLS+HTTP through the tunnel is the claim under
+ * test, and an application-level status says nothing about reachability. Only
+ * a transport error (connect timeout, ECONNRESET, abort) fails a target.
  *
  * Concurrency: at most maxConcurrent probes across exits; each exit is
  * serialized by the pool's inflight flag (dueForProbe sets it).
@@ -36,7 +50,15 @@ const PROBE_TIMEOUT_MS = 6_000
 
 export interface ProberOptions {
   maxConcurrent?: number
-  fetchIp?: (exit: ExitNode, dispatchers: DispatcherCache) => Promise<{ ip: string; latencyMs: number } | null>
+  /** The gateway's upstream models endpoint (GET {zen}/v1/models). Probed
+   *  first: an exit that can serve gateway traffic must never be judged dead
+   *  by generic connectivity sites it happens to block. */
+  upstreamUrl?: string
+  fetchIp?: (
+    exit: ExitNode,
+    dispatchers: DispatcherCache,
+    upstreamUrl?: string,
+  ) => Promise<{ ip: string; latencyMs: number } | null>
 }
 
 export class Prober {
@@ -46,6 +68,7 @@ export class Prober {
   readonly #dispatchers: DispatcherCache
   readonly #logger: ScopedLogger
   readonly #maxConcurrent: number
+  readonly #upstreamUrl: string | undefined
   readonly #fetchIp: NonNullable<ProberOptions['fetchIp']>
 
   constructor(pool: ExitPool, dispatchers: DispatcherCache, logger: ScopedLogger, options: ProberOptions = {}) {
@@ -53,6 +76,7 @@ export class Prober {
     this.#dispatchers = dispatchers
     this.#logger = logger
     this.#maxConcurrent = options.maxConcurrent ?? 6
+    this.#upstreamUrl = options.upstreamUrl
     this.#fetchIp = options.fetchIp ?? defaultFetchIp
   }
 
@@ -101,7 +125,7 @@ export class Prober {
 
   async #probeOne(node: ExitNode): Promise<void> {
     try {
-      const result = await this.#fetchIp(node, this.#dispatchers)
+      const result = await this.#fetchIp(node, this.#dispatchers, this.#upstreamUrl)
       if (result) {
         this.#pool.markProbe(node.id, true, result.latencyMs, result.ip)
         this.#logger.debug('probe ok', { exit: node.id, ip: result.ip, latencyMs: result.latencyMs })
@@ -117,20 +141,32 @@ export class Prober {
 }
 
 /**
- * Multi-site reachability verification through the exit. A round passes as
- * soon as ANY target answers (Google 204, YouTube, or the egress-IP echo) and
- * fails (null) only when every target is unreachable. When a reachability
- * site answers first we still try the identity echo afterwards to record the
- * egress IP for display/routing — but an ipify miss never invalidates an
- * already-proven tunnel.
+ * Multi-site reachability verification through the exit. The round passes as
+ * soon as ANY target answers — the upstream models endpoint first (an exit
+ * that serves gateway traffic is alive, full stop), then the generic
+ * connectivity sites — and fails (null) only when every target errors at the
+ * transport layer. Any HTTP status (404/429/5xx included) proves the tunnel:
+ * only connect timeouts, resets and aborts say the exit cannot carry traffic.
+ *
+ * When a reachability site answers we still try the identity echo afterwards
+ * to record the egress IP for display/routing — but an ipify miss never
+ * invalidates an already-proven tunnel.
+ *
+ * `targets` is injectable so tests can run fully offline against a local
+ * server; production always uses PROBE_TARGETS (+ upstream first).
  */
-async function defaultFetchIp(
+export async function defaultFetchIp(
   exit: ExitNode,
   dispatchers: DispatcherCache,
+  upstreamUrl?: string,
+  targets: ProbeTarget[] = PROBE_TARGETS,
 ): Promise<{ ip: string; latencyMs: number } | null> {
   const dispatcher = dispatchers.forExit(exit)
+  const round: ProbeTarget[] = upstreamUrl
+    ? [{ url: upstreamUrl, identity: false }, ...targets]
+    : targets
   let reached: { ip: string; latencyMs: number } | null = null
-  for (const target of PROBE_TARGETS) {
+  for (const target of round) {
     const started = Date.now()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
@@ -140,21 +176,16 @@ async function defaultFetchIp(
         signal: controller.signal,
         headers: { accept: target.identity ? 'application/json' : '*/*' },
       })
-      const okStatus = res.statusCode >= 200 && res.statusCode < 400
       const latencyMs = Date.now() - started
-      if (!okStatus) {
-        await res.body.dump()
-        continue
+      if (target.identity && res.statusCode >= 200 && res.statusCode < 400) {
+        const json = (await res.body.json()) as { ip?: unknown }
+        const ip = typeof json.ip === 'string' ? json.ip : ''
+        if (ip) return { ip, latencyMs }
       }
-      if (!target.identity) {
-        await res.body.dump()
-        reached ??= { ip: '', latencyMs }
-        continue
-      }
-      const json = (await res.body.json()) as { ip?: unknown }
-      const ip = typeof json.ip === 'string' ? json.ip : ''
-      if (!ip) continue
-      return { ip, latencyMs }
+      await res.body.dump()
+      // Any HTTP response through the tunnel counts as reached, with or
+      // without an identity payload.
+      reached ??= { ip: '', latencyMs }
     } catch {
       // This target failed through this exit; try the next one.
     } finally {
