@@ -7,8 +7,9 @@ dist-pack/
 op2gw-*.zip
 op2gw-*.tar.gz
 
-# Logs & temp files
+# Logs & temp files (logs/ holds proxy URIs with credentials — never track it)
 *.log
+logs/
 *.tmp
 *.temp
 

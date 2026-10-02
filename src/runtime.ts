@@ -36,7 +36,7 @@ export interface RuntimeStatus {
   proxy: string
 }
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 export class Runtime {
   readonly config: Op2gwConfig
