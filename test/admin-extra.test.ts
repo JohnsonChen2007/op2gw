@@ -7,7 +7,7 @@ import { join } from 'node:path'
 
 import { handleAdmin } from '../dist/admin/api.js'
 import { defaultConfig } from '../dist/core/config.js'
-import { Runtime } from '../dist/runtime.js'
+import { Runtime, VERSION } from '../dist/runtime.js'
 
 /**
  * Admin read + pool-control route tests — everything the debug UI talks to
@@ -125,7 +125,7 @@ test('GET /admin/status returns runtime, catalog, and pool snapshots', async () 
     const { status, body } = await call(rt, '/admin/status')
     assert.equal(status, 200)
     const s = body as { version: string; catalog: { exposed: number }; pool: { enabled: boolean; total: number }; logLevel: string; proxy: string }
-    assert.equal(s.version, '0.1.0')
+    assert.equal(s.version, VERSION, '/admin/status reports the runtime VERSION (never hardcode it here)')
     assert.equal(s.pool.enabled, true)
     assert.equal(s.pool.total, 1, 'direct is the only exit')
     assert.equal(s.logLevel, 'error')
