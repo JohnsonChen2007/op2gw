@@ -314,6 +314,12 @@ export function chatToResponsesBody(body: Json): Json {
 export function responsesToChatBody(body: Json): Json {
   const raw = Array.isArray(body.input) ? body.input : [body.input]
   const messages: Json[] = []
+  // The top-level `instructions` string has no chat slot, so it rides in as a
+  // leading system message — the mirror of chatToResponsesBody folding
+  // system/developer into `instructions`. Dropping it silently strips Codex's
+  // base instructions from every chat-wire model.
+  const instructionsText = textOf(body.instructions)
+  if (instructionsText.length > 0) messages.push({ role: 'system', content: instructionsText })
   for (const item of raw) {
     if (typeof item === 'string') {
       if (item.length > 0) messages.push({ role: 'user', content: item })
@@ -344,8 +350,11 @@ export function responsesToChatBody(body: Json): Json {
       })
       continue
     }
+    // `developer` is a Responses-dialect role; several chat providers (observed:
+    // Console/airlock for fledge-alpha) reject it outright while accepting the
+    // equivalent `system`. Normalize here, same rule as the reverse direction.
     const role = typeof item.role === 'string' ? item.role : 'user'
-    messages.push({ role, content: fromResponsesContent(item.content) })
+    messages.push({ role: role === 'developer' ? 'system' : role, content: fromResponsesContent(item.content) })
   }
   if (messages.length === 0) messages.push({ role: 'user', content: '' })
 
@@ -366,6 +375,69 @@ export function responsesToChatBody(body: Json): Json {
 
   const choice = responsesToolChoiceToChat(body.tool_choice)
   if (choice !== undefined) out.tool_choice = choice
+  return out
+}
+
+/**
+ * Strip caller-bound reasoning state from a Responses body before it leaves
+ * for the wire.
+ *
+ * Codex runs with `store: false` and `include: ["reasoning.encrypted_content"]`:
+ * the upstream mints encrypted reasoning blobs into its response, and Codex
+ * echoes them back inside `input` on every later turn. Those blobs are bound to
+ * the caller identity that minted them — and on the anonymous lane that
+ * identity is NOT stable across a conversation. The pool rotates exits by
+ * design (429 hops, rerouteSession, cooling/dead exits breaking stickiness) and
+ * the external watchdog switches the egress link on error streaks, so the turn
+ * that echoes a blob regularly arrives under a different identity than the
+ * turn that minted it. The provider then rejects the whole request with
+ * `400: reasoning 'encrypted_content' was not issued to this caller`
+ * (observed 2026-10-03 on muse-spark-1.3-contributor-free) — a non-rotatable
+ * validation error that kills the turn outright.
+ *
+ * No caller identity this gateway controls survives its own rotation policy,
+ * so the passthrough must never carry prior-turn reasoning at all: drop every
+ * `type: "reasoning"` input item (the chat direction already does exactly this
+ * in responsesToChatBody) and remove the `include` entry that asks upstream to
+ * mint blobs nothing can legitimately echo. Every request becomes
+ * self-contained — the only state that survives exit rotation. Codex loses
+ * cross-turn CoT replay, the same trade chat-wire models already live with;
+ * reasoning still happens fresh every turn.
+ *
+ * Well-formed bodies are returned by reference (no copy).
+ */
+export function stripCallerBoundReasoning(body: Json): Json {
+  let changed = false
+
+  // 1) Reasoning items never ride the wire.
+  let input: unknown[] | null = null
+  if (Array.isArray(body.input)) {
+    const items = body.input as unknown[]
+    const kept = items.filter((item) => !(isRecord(item) && item.type === 'reasoning'))
+    if (kept.length !== items.length) {
+      // An input emptied entirely by this filter would 400 upstream; fall back
+      // to the same placeholder chatToResponsesBody uses for an empty input.
+      input = kept.length > 0 ? kept : [{ role: 'user', content: '' }]
+      changed = true
+    }
+  }
+
+  // 2) Stop asking upstream to mint blobs that cannot be echoed back safely.
+  let include: unknown[] | null = null
+  if (Array.isArray(body.include)) {
+    const entries = body.include as unknown[]
+    const kept = entries.filter((entry) => entry !== 'reasoning.encrypted_content')
+    if (kept.length !== entries.length) {
+      include = kept.length > 0 ? kept : null // empty include rides as no field
+      changed = true
+    }
+  }
+
+  if (!changed) return body
+  const out: Json = { ...body }
+  if (input !== null) out.input = input
+  if (include !== null) out.include = include
+  else delete out.include
   return out
 }
 
@@ -592,6 +664,23 @@ function mapUsage(usage: unknown): Json | undefined {
     prompt_tokens: typeof input === 'number' ? input : 0,
     completion_tokens: typeof output === 'number' ? output : 0,
     total_tokens: typeof total === 'number' ? total : 0,
+  }
+}
+
+/** Upstream usage -> the Responses `response.usage` shape. Codex validates the
+ *  completed event against this dialect and aborts the stream on a mismatch
+ *  (`missing field input_tokens`), so the chat spelling cannot ride through. */
+function mapResponsesUsage(usage: unknown): Json | undefined {
+  if (!isRecord(usage)) return undefined
+  const input = usage.input_tokens ?? usage.prompt_tokens
+  const output = usage.output_tokens ?? usage.completion_tokens
+  if (typeof input !== 'number' && typeof output !== 'number') return undefined
+  const inTokens = typeof input === 'number' ? input : 0
+  const outTokens = typeof output === 'number' ? output : 0
+  return {
+    input_tokens: inTokens,
+    output_tokens: outTokens,
+    total_tokens: typeof usage.total_tokens === 'number' ? usage.total_tokens : inTokens + outTokens,
   }
 }
 
@@ -1002,7 +1091,7 @@ function chatEventToResponses(ctx: ResponsesCtx, evt: Json): string[] {
   const choices = Array.isArray(evt.choices) ? evt.choices : []
   if (typeof evt.model === 'string') ctx.model = evt.model
   if (typeof evt.created === 'number') ctx.created = evt.created
-  if (isRecord(evt.usage)) ctx.usage = mapUsage(evt.usage)
+  if (isRecord(evt.usage)) ctx.usage = mapResponsesUsage(evt.usage)
   out.push(...startResponses(ctx))
 
   for (const raw of choices) {

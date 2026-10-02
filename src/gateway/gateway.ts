@@ -18,6 +18,7 @@ import {
   responsesToChatBody,
   responsesToChatCompletion,
   responsesToChatStream,
+  stripCallerBoundReasoning,
 } from './protocol.js'
 
 /**
@@ -355,7 +356,13 @@ export class Gateway {
   #prepareBody(wireApi: UpstreamApi, clientApi: UpstreamApi, body: Record<string, unknown>): unknown {
     if (wireApi === 'responses') {
       const translated = clientApi === 'chat' ? chatToResponsesBody(body) : body
-      const { body: shaped } = ensureResponsesFreeLaneShape(translated)
+      // Codex echoes prior-turn `reasoning.encrypted_content` blobs that are
+      // bound to the caller identity that minted them; exit rotation makes
+      // that identity unstable, and the provider 400s the whole turn when the
+      // echo arrives under a different one. stripCallerBoundReasoning explains
+      // the full chain (protocol.ts).
+      const sanitized = stripCallerBoundReasoning(translated)
+      const { body: shaped } = ensureResponsesFreeLaneShape(sanitized)
       return shaped
     }
     const translated = clientApi === 'responses' ? responsesToChatBody(body) : body

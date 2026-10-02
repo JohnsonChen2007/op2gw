@@ -9,6 +9,7 @@ import {
   responsesToChatStream,
   resolveUpstreamApi,
   isResponsesWireModel,
+  stripCallerBoundReasoning,
 } from '../dist/gateway/protocol.js'
 import { ensureChatFreeLaneShape, ensureResponsesFreeLaneShape } from '../dist/core/freelane.js'
 
@@ -81,6 +82,68 @@ test('chat -> responses merges multiple system/developer turns into instructions
 test('responses -> chat keeps working for a plain user turn', () => {
   const out = responsesToChatBody({ model: 'big-pickle', input: [{ role: 'user', content: 'hi' }], stream: true })
   assert.deepEqual(out.messages, [{ role: 'user', content: 'hi' }])
+})
+
+/**
+ * Regression: a codex echo of prior-turn `reasoning.encrypted_content` blobs
+ * 400s with `reasoning 'encrypted_content' was not issued to this caller`
+ * whenever the echo reaches the provider under a different caller identity
+ * than the one that minted the blobs — which exit rotation makes routine.
+ * The passthrough must therefore never carry reasoning items or the include
+ * entry that asks for new blobs.
+ */
+test('stripCallerBoundReasoning drops reasoning items and trims the encrypted_content include', () => {
+  const out = stripCallerBoundReasoning({
+    model: 'muse-spark-1.3-contributor-free',
+    instructions: 'base instructions',
+    input: [
+      { role: 'user', content: 'list files' },
+      { type: 'reasoning', summary: [], encrypted_content: 'gAAAAA issued-by-exit-a' },
+      { type: 'function_call', call_id: 'call_1', name: 'bash', arguments: '{"cmd":"ls"}' },
+      { type: 'function_call_output', call_id: 'call_1', output: 'a.txt' },
+      { type: 'reasoning', encrypted_content: 'gAAAAA issued-by-exit-b' },
+      { role: 'assistant', content: 'done' },
+    ],
+    include: ['reasoning.encrypted_content'],
+    store: false,
+    stream: true,
+  })
+  const input = out.input as Array<Record<string, unknown>>
+  assert.deepEqual(
+    input.map((item) => item.type ?? item.role),
+    ['user', 'function_call', 'function_call_output', 'assistant'],
+    'every reasoning item is gone; message/function items keep their order',
+  )
+  assert.equal(out.include, undefined, 'the only include entry was the encrypted_content one')
+  assert.equal(out.instructions, 'base instructions')
+  assert.equal(out.store, false)
+})
+
+test('stripCallerBoundReasoning keeps unrelated include entries and drops the field when trimmed empty', () => {
+  const kept = stripCallerBoundReasoning({
+    input: [{ role: 'user', content: 'hi' }],
+    include: ['reasoning.encrypted_content', 'message.output_text.logprobs'],
+  })
+  assert.deepEqual(kept.include, ['message.output_text.logprobs'])
+
+  const dropped = stripCallerBoundReasoning({
+    input: [{ role: 'user', content: 'hi' }],
+    include: ['reasoning.encrypted_content'],
+  })
+  assert.equal(dropped.include, undefined)
+})
+
+test('stripCallerBoundReasoning returns a body without reasoning state by reference', () => {
+  const body = { model: 'muse-spark-1.3-contributor-free', input: [{ role: 'user', content: 'hi' }], stream: true }
+  assert.equal(stripCallerBoundReasoning(body), body, 'no copy when there is nothing to strip')
+})
+
+test('stripCallerBoundReasoning falls back to a placeholder when reasoning items were the whole input', () => {
+  const out = stripCallerBoundReasoning({
+    model: 'muse-spark-1.3-contributor-free',
+    input: [{ type: 'reasoning', encrypted_content: 'gAAAAA' }],
+  })
+  assert.deepEqual(out.input, [{ role: 'user', content: '' }])
 })
 
 test('the responses free-lane gate normalises a string input to an array', () => {
