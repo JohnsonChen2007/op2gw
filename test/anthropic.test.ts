@@ -251,6 +251,69 @@ test('chatToMessagesStream gives each tool call its own content block index', as
   assert.deepEqual(stops, ['1', '2'])
 })
 
+test('chatToMessagesStream splits parallel tool calls that reuse index 0 with a new id', async () => {
+  // Relay providers on the chat wire routinely stream every parallel call
+  // under `index: 0`, distinguishing them only by a fresh `id`. Routing by
+  // index alone concatenated both calls' arguments into one block, and
+  // Claude Code reported `{...}{...}` as an unparseable Bash input.
+  const dup = '{"command":"pwd","description":"Print current working directory"}'
+  const out = await collect(
+    chatToMessagesStream(
+      sse([
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'Bash', arguments: dup } }] } }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: 'c2', function: { name: 'Bash', arguments: dup } }] } }] },
+        { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      ]),
+      'm',
+    ),
+  )
+  const argsByBlock = new Map<number, string>()
+  for (const line of out.matchAll(/^data: (.*)$/gm)) {
+    const evt = JSON.parse(line[1]!) as Record<string, unknown>
+    if (evt.type !== 'content_block_delta') continue
+    const delta = evt.delta as Record<string, unknown>
+    if (delta.type !== 'input_json_delta') continue
+    const idx = evt.index as number
+    argsByBlock.set(idx, (argsByBlock.get(idx) ?? '') + String(delta.partial_json))
+  }
+  assert.deepEqual([...argsByBlock.keys()].sort((a, b) => a - b), [1, 2], 'both calls get their own block')
+  for (const args of argsByBlock.values()) {
+    assert.deepEqual(
+      JSON.parse(args),
+      { command: 'pwd', description: 'Print current working directory' },
+      'each block must carry exactly one complete JSON object',
+    )
+  }
+  // The reused-index case closes the previous block before opening the next.
+  const seq = [...out.matchAll(/^data: \{"type":"(content_block_\w+)","index":(\d+)/gm)].map((m) => `${m[1]}:${m[2]}`)
+  assert.deepEqual(seq, [
+    'content_block_start:0',
+    'content_block_start:1',
+    'content_block_delta:1',
+    'content_block_stop:1',
+    'content_block_start:2',
+    'content_block_delta:2',
+    'content_block_stop:2',
+  ])
+})
+
+test('chatToMessagesStream starts a new block when tool-call fragments omit index', async () => {
+  const out = await collect(
+    chatToMessagesStream(
+      sse([
+        { choices: [{ delta: { tool_calls: [{ id: 'c1', function: { name: 'Bash', arguments: '{"a":1}' } }] } }] },
+        { choices: [{ delta: { tool_calls: [{ id: 'c2', function: { name: 'Read', arguments: '{"b":2}' } }] } }] },
+        { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+      ]),
+      'm',
+    ),
+  )
+  const starts = [...out.matchAll(/"type":"content_block_start","index":(\d+)/g)].map((m) => m[1])
+  assert.deepEqual(starts, ['0', '1', '2'])
+  assert.match(out, /"partial_json":"\{\\\"a\\\":1\}"/)
+  assert.match(out, /"partial_json":"\{\\\"b\\\":2\}"/)
+})
+
 test('chatToMessagesStream surfaces an in-stream error as an Anthropic error event', async () => {
   const out = await collect(
     chatToMessagesStream(sse([{ error: { message: 'upstream exploded' } }]), 'm'),

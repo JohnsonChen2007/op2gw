@@ -744,18 +744,30 @@ function responsesEventToChat(ctx: ChatCtx, evt: Json): string[] {
       const key = String(item.id ?? evt.item_id ?? '')
       const index = ctx.toolIndex.get(key) ?? ctx.toolCalls.size
       const existing = ctx.toolCalls.get(index)
+      const streamed = existing?.args ?? ''
+      const full = typeof item.arguments === 'string' ? item.arguments : undefined
       const call = {
         id: String(item.call_id ?? item.id ?? existing?.id ?? `call_${index}`),
         name: String(item.name ?? existing?.name ?? ''),
-        args: typeof item.arguments === 'string' ? item.arguments : (existing?.args ?? ''),
+        args: full ?? streamed,
       }
       ctx.toolIndex.set(key, index)
       ctx.toolCalls.set(index, call)
       ctx.finish = 'tool_calls'
+      // The chat SSE contract APPENDS every `arguments` fragment per index.
+      // The deltas above already streamed this call, so replaying the full
+      // string (or the accumulated `streamed` copy when the item omits
+      // `arguments`) doubles it: the client parses `{...}{...}` as invalid
+      // JSON — the Claude Code "input JSON failed to parse" failure. Forward
+      // only what has not streamed yet; on a divergent final string, keep
+      // what streamed rather than corrupting the block further.
+      let pending = ''
+      if (streamed.length === 0) pending = full ?? ''
+      else if (full !== undefined && full.length > streamed.length && full.startsWith(streamed)) pending = full.slice(streamed.length)
       out.push(...ensureRole(ctx))
       out.push(
         chatChunk(ctx, {
-          tool_calls: [{ index, id: call.id, type: 'function', function: { name: call.name, arguments: call.args } }],
+          tool_calls: [{ index, id: call.id, type: 'function', function: { name: call.name, arguments: pending } }],
         }, null),
       )
     }
