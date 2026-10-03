@@ -134,9 +134,60 @@ test('responsesToChatStream forwards a function_call as chat tool_calls and fini
       if (typeof frag === 'string' && frag.length > 0) argsFragments.push(frag)
     }
   }
-  assert.equal(argsFragments.join(''), '{"path":"a"}{"path":"a"}', 'deltas stream incrementally, done replays the full args')
+  // done must NOT replay what the deltas already streamed: chat consumers
+  // append every arguments fragment, and `{...}{...}` fails to parse at the
+  // client (Claude Code "input JSON failed to parse").
+  assert.equal(argsFragments.join(''), '{"path":"a"}', 'arguments arrive exactly once')
+  assert.equal(JSON.parse(argsFragments.join('')).path, 'a')
   assert.ok(text.includes('"finish_reason":"tool_calls"'), 'tool-call finish reason preserved')
   assert.ok(text.includes('data: [DONE]'))
+})
+
+test('responsesToChatStream does not replay accumulated args when done omits arguments', async () => {
+  const model = 'muse-spark-1.3-contributor-free'
+  const ev = (type: string, extra: unknown): string => `event: ${type}\ndata: ${JSON.stringify({ type, ...extra })}\n\n`
+  const sse =
+    ev('response.created', { response: { id: 'resp_tc', model, created_at: 100 } }) +
+    ev('response.output_item.added', { item: { id: 'fc_1', type: 'function_call', call_id: 'call_7', name: 'read' } }) +
+    ev('response.function_call_arguments.delta', { item_id: 'fc_1', delta: '{"path":"a"}' }) +
+    ev('response.output_item.done', { item: { id: 'fc_1', type: 'function_call', call_id: 'call_7', name: 'read' } }) +
+    ev('response.completed', { response: { id: 'resp_tc', model, status: 'completed' } })
+  const text = await collect(responsesToChatStream(Readable.from([sse]), model))
+  const argsFragments: string[] = []
+  for (const e of ssePayloads(text)) {
+    const calls = (e.choices as Array<{ delta?: { tool_calls?: Array<{ function?: { arguments?: string } }> } }> | undefined)?.[0]?.delta
+      ?.tool_calls
+    for (const call of calls ?? []) {
+      const frag = call.function?.arguments
+      if (typeof frag === 'string' && frag.length > 0) argsFragments.push(frag)
+    }
+  }
+  assert.equal(argsFragments.join(''), '{"path":"a"}', 'a done without an arguments field replays nothing')
+})
+
+test('responsesToChatStream forwards full args on done when no deltas streamed', async () => {
+  // Providers whose delta events carry an item_id that never matches the
+  // registered key drop their deltas; done is then the only copy and must
+  // still deliver the complete arguments exactly once.
+  const model = 'muse-spark-1.3-contributor-free'
+  const ev = (type: string, extra: unknown): string => `event: ${type}\ndata: ${JSON.stringify({ type, ...extra })}\n\n`
+  const sse =
+    ev('response.created', { response: { id: 'resp_tc', model, created_at: 100 } }) +
+    ev('response.output_item.added', { item: { id: 'fc_1', type: 'function_call', call_id: 'call_7', name: 'read', arguments: '' } }) +
+    ev('response.function_call_arguments.delta', { item_id: 'fc_orphan', delta: 'GONE' }) +
+    ev('response.output_item.done', { item: { id: 'fc_1', type: 'function_call', call_id: 'call_7', name: 'read', arguments: '{"path":"a"}' } }) +
+    ev('response.completed', { response: { id: 'resp_tc', model, status: 'completed' } })
+  const text = await collect(responsesToChatStream(Readable.from([sse]), model))
+  const argsFragments: string[] = []
+  for (const e of ssePayloads(text)) {
+    const calls = (e.choices as Array<{ delta?: { tool_calls?: Array<{ function?: { arguments?: string } }> } }> | undefined)?.[0]?.delta
+      ?.tool_calls
+    for (const call of calls ?? []) {
+      const frag = call.function?.arguments
+      if (typeof frag === 'string' && frag.length > 0) argsFragments.push(frag)
+    }
+  }
+  assert.deepEqual(argsFragments, ['{"path":"a"}'])
 })
 
 test('responsesToChatBody maps function_call items into assistant tool_calls', () => {

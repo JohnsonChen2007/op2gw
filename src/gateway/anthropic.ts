@@ -334,12 +334,23 @@ function sseEvent(event: string, data: unknown): string {
  * Emits the full Anthropic event sequence. Text deltas share content block
  * index 0; each tool call gets its own index. `message_delta` carries the final
  * stop_reason and usage, which is where Claude Code reads token counts.
+ *
+ * Tool-call fragments are routed to blocks by `id` first, then by the `index`
+ * an id was last bound to, and an `index` that reappears with a *different*
+ * id opens a new block. Relay providers on the chat wire routinely stream
+ * every parallel call under `index: 0` (or omit `index` outright) and
+ * distinguish calls only by a fresh `id`; routing by index alone — with a
+ * default of 0 — concatenated their arguments into one invalid JSON payload
+ * (`{...}{...}`), which Claude Code surfaces as a Bash InputValidationError.
  */
 export function chatToMessagesStream(source: Readable, requestedModel: string): Readable {
   const model = requestedModel
   let textOpen = false
-  // tool index -> { blockIndex, json buffer, name }
-  const toolState = new Map<number, { blockIndex: number; args: string; name: string }>()
+  type ToolBlock = { blockIndex: number; args: string; name: string; id: string; open: boolean }
+  const toolBlocks: ToolBlock[] = []
+  const byCallId = new Map<string, ToolBlock>()
+  const byCallIndex = new Map<number, ToolBlock>()
+  let currentTool: ToolBlock | null = null
   let nextBlockIndex = 1 // 0 is reserved for text
   let finishReason: string | null = null
   let usage: unknown
@@ -368,8 +379,10 @@ export function chatToMessagesStream(source: Readable, requestedModel: string): 
       out += sseEvent('content_block_stop', { type: 'content_block_stop', index: 0 })
       textOpen = false
     }
-    for (const [, state] of toolState) {
-      out += sseEvent('content_block_stop', { type: 'content_block_stop', index: state.blockIndex })
+    for (const block of toolBlocks) {
+      if (!block.open) continue
+      out += sseEvent('content_block_stop', { type: 'content_block_stop', index: block.blockIndex })
+      block.open = false
     }
     out += sseEvent('message_delta', {
       type: 'message_delta',
@@ -448,28 +461,61 @@ export function chatToMessagesStream(source: Readable, requestedModel: string): 
         if (Array.isArray(delta.tool_calls)) {
           for (const call of delta.tool_calls) {
             if (!isRecord(call)) continue
-            const callIndex = typeof call.index === 'number' ? call.index : 0
             const fn = isRecord(call.function) ? (call.function as Json) : {}
-            let state = toolState.get(callIndex)
-            if (!state) {
-              state = { blockIndex: nextBlockIndex, args: '', name: typeof fn.name === 'string' ? fn.name : 'unknown' }
+            const callId = typeof call.id === 'string' && call.id.length > 0 ? call.id : undefined
+            const callIndex = typeof call.index === 'number' ? call.index : undefined
+
+            let block: ToolBlock | undefined
+            if (callId !== undefined) {
+              block = byCallId.get(callId)
+              if (!block && callIndex !== undefined) {
+                const aliased = byCallIndex.get(callIndex)
+                if (aliased && aliased.id === callId) block = aliased
+              }
+            } else if (callIndex !== undefined) {
+              block = byCallIndex.get(callIndex)
+            } else {
+              block = currentTool ?? undefined
+            }
+
+            if (!block) {
+              // The index reappears under a different id: the earlier call on
+              // that index is done. Close its block before opening the new
+              // one — Anthropic requires content_block_stop between blocks.
+              if (callIndex !== undefined) {
+                const stale = byCallIndex.get(callIndex)
+                if (stale && stale.open) {
+                  push(sseEvent('content_block_stop', { type: 'content_block_stop', index: stale.blockIndex }))
+                  stale.open = false
+                }
+              }
+              block = {
+                blockIndex: nextBlockIndex,
+                args: '',
+                name: typeof fn.name === 'string' && fn.name.length > 0 ? fn.name : 'unknown',
+                id: callId ?? `index:${callIndex ?? nextBlockIndex}`,
+                open: true,
+              }
               nextBlockIndex += 1
-              toolState.set(callIndex, state)
+              toolBlocks.push(block)
               push(
                 sseEvent('content_block_start', {
                   type: 'content_block_start',
-                  index: state.blockIndex,
-                  content_block: { type: 'tool_use', id: `call_${Math.random().toString(36).slice(2, 12)}`, name: state.name, input: {} },
+                  index: block.blockIndex,
+                  content_block: { type: 'tool_use', id: `call_${Math.random().toString(36).slice(2, 12)}`, name: block.name, input: {} },
                 }),
               )
             }
-            if (typeof fn.name === 'string' && fn.name.length > 0) state.name = fn.name
+            if (callId !== undefined) byCallId.set(callId, block)
+            if (callIndex !== undefined) byCallIndex.set(callIndex, block)
+            currentTool = block
+            if (typeof fn.name === 'string' && fn.name.length > 0) block.name = fn.name
             if (typeof fn.arguments === 'string' && fn.arguments.length > 0) {
-              state.args += fn.arguments
+              block.args += fn.arguments
               push(
                 sseEvent('content_block_delta', {
                   type: 'content_block_delta',
-                  index: state.blockIndex,
+                  index: block.blockIndex,
                   delta: { type: 'input_json_delta', partial_json: fn.arguments },
                 }),
               )
