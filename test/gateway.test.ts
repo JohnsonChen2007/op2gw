@@ -257,6 +257,59 @@ test('rotates to a fresh exit after a 429 and succeeds', async () => {
   assert.equal(pool.usableCount(CHAT_MODEL), 1, 'the 429 exit cools while the other serves')
 })
 
+test('rotates on the vague Console 400 and succeeds on a fresh exit', async () => {
+  // The Console provider intermittently rejects valid bodies with a field-less
+  // `invalid request` — the same wire body passes on replay (2026-10-03), so it
+  // must rotate like an exit-shaped failure instead of killing the turn.
+  let hits = 0
+  const { url, seen } = await startZen((_seen, res) => {
+    hits += 1
+    if (hits === 1) {
+      return json(400, {
+        error: {
+          type: 'invalid_request_error',
+          message: 'Error from provider (Console): Upstream request failed: [invalid_request_error] invalid request',
+        },
+      }, res)
+    }
+    return sse(200, chatSse(CHAT_MODEL, 'after vague 400'), res)
+  })
+  const { gateway } = makeGateway(url, { poolEnabled: true, exits: ['http://exit-a:1', 'http://exit-b:1'] })
+  const result = await gateway.handle({
+    api: 'chat',
+    body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+    clientStream: true,
+  })
+  const text = await collect(result.body)
+  assert.ok(text.includes('after vague 400'))
+  assert.equal(result.trace.attempts, 2)
+  assert.equal(seen.length, 2)
+})
+
+test('surfaces a named 400 immediately without rotating', async () => {
+  // A 400 that names the offending shape is a real validation error: rotating
+  // cannot fix it, so the first failure surfaces to the client as-is.
+  const { url, seen } = await startZen((_seen, res) => {
+    return json(400, {
+      error: {
+        type: 'invalid_request_error',
+        message:
+          'Error from provider (Console): Upstream request failed: [airlock_error] invalid request: unknown variant `developer`, expected one of `system`, `user`, `assistant`, `tool` at line 1 column 55',
+      },
+    }, res)
+  })
+  const { gateway } = makeGateway(url, { poolEnabled: true, exits: ['http://exit-a:1', 'http://exit-b:1'] })
+  await assert.rejects(
+    gateway.handle({
+      api: 'chat',
+      body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      clientStream: true,
+    }),
+    (err: unknown) => err instanceof GatewayHttpError && err.status === 400 && /unknown variant/.test(err.message),
+  )
+  assert.equal(seen.length, 1)
+})
+
 test('rotates on a region refusal', async () => {
   let hits = 0
   const { url, seen } = await startZen((_seen, res) => {
