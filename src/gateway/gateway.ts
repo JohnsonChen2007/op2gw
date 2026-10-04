@@ -228,9 +228,18 @@ export class Gateway {
           // across exits, so the wire body itself was the failing suspect.
           log.warn('upstream 400 wire-body shape', { model, tools: toolShapeSummary(wireBody) })
         }
-        // Non-retryable statuses (400) surface immediately; we keep rotating within
-        // budget on exit-shaped failures only.
-        const rotatable = status !== 400 && (kind === 'limited' || kind === 'transport' || kind === 'server' || kind === 'refused' || kind === 'region')
+        // Non-retryable statuses surface immediately; we keep rotating within
+        // budget on exit-shaped failures only. Exception: the Console provider's
+        // vague 400 is flaky upstream, not a request bug — the identical wire
+        // body passes on replay (observed 2026-10-03: one Codex tool round 400'd
+        // on two exits ~6min apart, then the same body passed 8/9 direct
+        // replays) — so it rotates too. Genuinely invalid bodies are always
+        // named by the provider (`unknown variant developer`, `tool_call_id`,
+        // `encrypted_content`), so the field-less message is the safe key.
+        const rotatable =
+          (status !== 400 &&
+            (kind === 'limited' || kind === 'transport' || kind === 'server' || kind === 'refused' || kind === 'region')) ||
+          (status === 400 && isVagueProvider400((err as Error).message))
         if (!rotatable || attempt >= maxAttempts) {
           break
         }
@@ -409,6 +418,22 @@ export class GatewayHttpError extends Error {
   toOpenAIBody(): string {
     return JSON.stringify({ error: { message: this.message, type: this.type, code: null } })
   }
+}
+
+/**
+ * The Console provider's flaky 400: an `invalid_request_error` that names no
+ * field — `Error from provider (Console): Upstream request failed:
+ * [invalid_request_error] invalid request`. Every deterministic validation
+ * failure this gateway has observed carries the offending detail instead
+ * (`[airlock_error] invalid request: unknown variant \`developer\``,
+ * `[400] messages[10]: tool messages must include...`, `reasoning
+ * \`encrypted_content\` was not issued to this caller`), so the bare message
+ * uniquely identifies the flavor that the same wire body survives on replay.
+ * Matching the exact bracketed token also keeps `[airlock_error] invalid
+ * request: …` (a REAL shape error) non-rotatable.
+ */
+function isVagueProvider400(message: string): boolean {
+  return message.includes('[invalid_request_error] invalid request')
 }
 
 /**
