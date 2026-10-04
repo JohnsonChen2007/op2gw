@@ -48,9 +48,9 @@ SCENES = [
         "note": "核心洞察：只有独占 HTTP 客户端，才能做到「这次走出口 A，下次走出口 B」。",
         "narration": (
             "op2gw 是从 opencode2dsh 这个进程内插件演进出来的独立网关，核心差别只有一条：HTTP 客户端归谁。"
-            "插件形态下，内置的 fetch 被宿主抢占，只能用全局代理去 hack，出口粒度受限；"
-            "而网关独占自己的 HTTP 客户端，于是每个请求都能单独指定出口。"
-            "这就是它能做按请求 IP 轮换的结构性原因。"
+            "插件形态下 fetch 被宿主抢占，只能用全局代理 hack，出口粒度受限；"
+            "网关独占自己的客户端，于是每个请求都能单独指定出口。"
+            "这就是它能做按请求 IP 轮换的原因。"
         ),
     },
     {
@@ -66,11 +66,10 @@ SCENES = [
         "code_title": "凭证就是字面量",
         "code": 'Authorization: Bearer public\n# 无需任何 key · 不存储 · 无遥测',
         "narration": (
-            "第一个核心功能，是让匿名免费通道真正能用起来。"
-            "OpenCode Zen 的免费层有两道门禁，缺一不可。"
-            "第一道是会话形状：会话 ID 必须是规范的十六进制加 Base62 格式，"
-            "而且由对话首条用户消息哈希派生，这样多轮对话时 ID 保持稳定。"
-            "第二道是智能体形态：请求体必须流式，并且带上 bash 和 read 两个工具声明，缺了就自动注入。"
+            "第一个核心功能，是让匿名免费通道真正能用起来。免费层有两道门禁。"
+            "第一道是会话形状：会话 ID 必须符合官方格式，"
+            "而且由对话首条用户消息哈希派生，多轮对话时保持稳定。"
+            "第二道是智能体形态：请求体必须流式，并且带上 bash 和 read 两个工具声明，缺了自动注入。"
             "至于凭证，就是字面量 Bearer public，不需要任何 key。"
         ),
     },
@@ -158,10 +157,10 @@ SCENES = [
         "clients": "接入：opencode · Claude Code · curl · OpenAI Python SDK —— base_url 填 http://127.0.0.1:8787/v1",
         "narration": (
             "最后说怎么用。前置条件只要 Node.js 二十以上。"
-            "macOS 和 Linux 上执行 install.sh，检查环境、装依赖、编译、启动一条龙；"
+            "macOS 和 Linux 执行 install.sh，装依赖、编译、启动一条龙；"
             "Windows 用 PowerShell 跑 install.ps1。"
-            "启动之后打开调试台，curl 一下 v1 斜杠 models 就能看到免费的模型清单。"
-            "要接 opencode 或者 Claude Code，把 base URL 指向本机的 8787 端口就行。"
+            "启动后打开调试台，curl 一下 v1 斜杠 models 就是免费的模型清单。"
+            "要接 opencode 或 Claude Code，把 base URL 指向本机 8787 端口就行。"
             "op2gw，开源免费，随取随用。"
         ),
     },

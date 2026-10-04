@@ -1,0 +1,37 @@
+{
+  "rate": "+24%",
+  "scenes": [
+    {
+      "id": "01-cover",
+      "duration": 14.510000000000002
+    },
+    {
+      "id": "02-author",
+      "duration": 19.87
+    },
+    {
+      "id": "03-why-gateway",
+      "duration": 21.118000000000002
+    },
+    {
+      "id": "04-gate",
+      "duration": 24.886
+    },
+    {
+      "id": "05-pool",
+      "duration": 24.574
+    },
+    {
+      "id": "06-catalog",
+      "duration": 24.958000000000002
+    },
+    {
+      "id": "07-console",
+      "duration": 24.55
+    },
+    {
+      "id": "08-howto",
+      "duration": 27.806
+    }
+  ]
+}

@@ -74,11 +74,14 @@ def _base_css(a):
               margin-bottom:.42em; }}
   h1.title .hl {{ background:linear-gradient(96deg,#38BDF8,#A78BFA 72%);
                   -webkit-background-clip:text; background-clip:text; color:transparent; }}
-  p.lead {{ font-size:var(--lead); line-height:1.52; color:#9FB0CC; max-width:96%; margin-bottom:var(--gap); }}
+  p.lead {{ font-size:var(--lead); line-height:1.52; color:#9FB0CC; max-width:96%;
+            margin-bottom:var(--gap); flex:0 0 auto; }}
 
-  .body {{ flex:1; display:flex; flex-direction:column; gap:var(--gap); min-height:0; }}
-  /* 子项不压缩（内容超出后由 JS 整体缩放），但 .body 本身要允许被压缩，
-     否则 flex 的 min-height:auto 会把它顶出画面、挤掉底栏 */
+  /* 标题 + 导语 + 正文作为一整块在画面中垂直居中，避免正文被单独居中后
+     与导语之间出现大片空洞 */
+  .main {{ flex:1; display:flex; flex-direction:column; justify-content:center; min-height:0; }}
+  .body {{ display:flex; flex-direction:column; gap:var(--gap); }}
+  /* 子项不压缩（内容超出后由 JS 整体缩放） */
   .body > * {{ flex:0 0 auto; }}
   .grid2 {{ display:grid; grid-template-columns:repeat(var(--cols),1fr); gap:var(--gap); }}
 
@@ -196,14 +199,14 @@ FIT_JS = """
 <script>
 (function(){
   function fit(){
-    var b=document.querySelector('.body'); if(!b) return;
-    b.style.transform=''; b.style.width='';              // 先复位再量
-    var avail=b.getBoundingClientRect().height, need=b.scrollHeight;
+    var m=document.querySelector('.main'); if(!m) return;
+    m.style.transform=''; m.style.width='';               // 先复位再量
+    var avail=m.getBoundingClientRect().height, need=m.scrollHeight;
     if(need>avail+1){
       var k=Math.max(0.55, avail/need);
-      b.style.transform='scale('+k+')';
-      b.style.transformOrigin='top left';
-      b.style.width=(100/k)+'%';                          // 先放宽再缩放，视觉宽度不变
+      m.style.transform='scale('+k+')';
+      m.style.transformOrigin='top left';
+      m.style.width=(100/k)+'%';                           // 先放宽再缩放，视觉宽度不变
     }
   }
   fit();
@@ -260,9 +263,10 @@ def render(scene, aspect, progress):
         <div class="idx">{esc(scene['id'].split('-')[0])} / 08</div>
         <div class="rule"></div>
       </div>
-      <h1 class="title">{esc(scene['title'])}</h1>
-      <p class="lead">{esc(scene['lead'])}</p>
-      <div class="body">"""
+      <div class="main">
+        <h1 class="title">{esc(scene['title'])}</h1>
+        <p class="lead">{esc(scene['lead'])}</p>
+        <div class="body">"""
     )
 
     if L == "cards":
@@ -344,6 +348,8 @@ def render(scene, aspect, progress):
         )
 
     b.append("</div>")
+    b.append("</div>")   # /.body
+    b.append("</div>")   # /.main
     b.append(_foot(progress, aspect))
-    b.append("</div>")
+    b.append("</div>")   # /.slide
     return _head(aspect, "".join(b))
