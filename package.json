@@ -1,6 +1,6 @@
 {
   "name": "op2gw",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "op2gw — a standalone OpenAI v1-compatible gateway that fronts the OpenCode Zen anonymous free lane, with a multi-exit dynamic IP pool, live catalog, structured logging, self-healing, and a built-in debug web UI.",
   "type": "module",
