@@ -1,0 +1,19 @@
+{
+  "name": "dev-op2gw-afe4afcc",
+  "plugins": [
+    {
+      "name": "model-live-monitor",
+      "source": "./model-live-monitor",
+      "version": "0.1.0",
+      "description": "实时查看 ZCode 当前调用的模型与生成速度：读取 rollout 模型调用记录，输出每次调用的耗时、输出 token 与 tok/s，支持实时跟随、最近调用列表、按模型速度汇总，并在每次提问时自动注入最近一次调用的速度状态。",
+      "displayName": "Model Live Monitor",
+      "displayName_i18n": {
+        "zh-CN": "模型实时监控"
+      },
+      "description_i18n": {
+        "zh-CN": "实时查看当前调用的模型与生成速度：查询最近一次调用、最近调用列表、按模型速度汇总、实时跟随新调用；并在每次提问时自动注入最近一次调用的速度状态。"
+      },
+      "category": "developer-tools"
+    }
+  ]
+}

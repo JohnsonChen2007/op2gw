@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "for c in \"$(command -v node 2>/dev/null)\" /opt/homebrew/bin/node /usr/local/bin/node \"$HOME\"/.nvm/versions/node/*/bin/node; do if [ -x \"$c\" ]; then exec \"$c\" \"${CLAUDE_PLUGIN_ROOT}/scripts/hook-status.mjs\"; fi; done; cat >/dev/null; exit 0",
+            "timeoutMs": 5000,
+            "statusMessage": "读取最近一次模型调用速度"
+          }
+        ]
+      }
+    ]
+  }
+}
