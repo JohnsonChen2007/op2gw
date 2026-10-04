@@ -35,3 +35,9 @@ VERIFY-REPORT.md
 # Agent runtime state
 .pi/
 .pi-glla/
+
+# Video build scratch and rendered outputs (too large for git; the mp4s ship
+# as GitHub release assets instead)
+python-history/
+video/*.mp4
+video/build/audio/
