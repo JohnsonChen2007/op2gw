@@ -21,7 +21,7 @@
 # OP2GW_WATCHDOG_MIN_INTERVAL, OP2GW_WATCHDOG_RECENT_MS, OP2GW_WATCHDOG_DRY_RUN.
 set -u
 
-ROOT="/Users/esadmin/src/opencode2gw/op2gw"
+ROOT="${OP2GW_ROOT:-$HOME/src/opencode2gw/op2gw}"
 LOG="${OP2GW_WATCHDOG_LOG:-$ROOT/logs/op2gw.log}"
 STATE="$ROOT/logs/watchdog.state"
 CFG="$HOME/.op2gw/config.json"
