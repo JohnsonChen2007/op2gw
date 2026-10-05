@@ -3,7 +3,7 @@
 # launchd holds the log file descriptor open, so we use copy+truncate instead of rename.
 set -u
 
-LOG_DIR="/Users/esadmin/src/opencode2gw/op2gw/logs"
+LOG_DIR="${OP2GW_LOG_DIR:-$HOME/src/opencode2gw/op2gw/logs}"
 LOG="$LOG_DIR/op2gw.log"
 KEEP=7
 
