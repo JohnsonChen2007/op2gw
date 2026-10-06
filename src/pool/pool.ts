@@ -219,9 +219,10 @@ export class ExitPool {
 
   /**
    * Pick an exit for (model, session). Order: sticky binding (if still usable)
-   * -> pinned (if usable) -> best usable candidate (freshest health, lowest
-   * latency / load-balanced top tier). Accepts an optional `exclude` set of exit IDs
-   * to avoid retrying exits that already failed for this request.
+   * -> pinned (if usable) -> round-robin across every usable candidate (even
+   * spread; per-IP quota is the resource being pooled). Accepts an optional
+   * `exclude` set of exit IDs to avoid retrying exits that already failed for
+   * this request.
    */
   pick(model: string, session: string, exclude?: Set<string>): PickResult | null {
     const stickyId = this.#sticky.get(session)
@@ -255,17 +256,13 @@ export class ExitPool {
       if (la !== lb) return la - lb
       return b.addedAt - a.addedAt
     })
-    const bestCandidate = candidates[0]!
-    const bestLatency = bestCandidate.latencyMs || 0
-    const tolerance = Math.max(30, bestLatency * 0.3)
-    const topTier = candidates.filter((c) => {
-      if (c.pinned !== bestCandidate.pinned) return false
-      const lat = c.latencyMs || 0
-      return Math.abs(lat - bestLatency) <= tolerance
-    })
-    const chosen = topTier.length > 1
-      ? topTier[(this.#rrIndex++) % topTier.length]!
-      : bestCandidate
+    // Round-robin across ALL usable candidates, not just a latency top tier.
+    // The free lane meters quota per egress IP, so letting every fresh session
+    // pile onto the lowest-latency exit (the old behavior) exhausted that one
+    // IP's quota while the rest sat idle — the "single-IP 429" failure mode.
+    // Cycling the whole usable set spreads fresh conversations evenly; the
+    // sticky binding keeps each conversation on its assigned exit afterwards.
+    const chosen = candidates[this.#rrIndex++ % candidates.length]!
     this.#sticky.set(session, chosen.id)
     return { exit: chosen, sticky: false }
   }
