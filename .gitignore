@@ -31,6 +31,7 @@ status.json
 # Local verification & debug scripts with real credentials
 tlscheck.mjs
 VERIFY-REPORT.md
+.cf-egress-test/
 
 # Agent runtime state
 .pi/
