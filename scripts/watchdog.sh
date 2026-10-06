@@ -7,24 +7,41 @@
 #                       "pool degraded..." (pool starved, requests refused)
 #   - resets the count: "request ok" (traffic is flowing again)
 #   - neutral:          anything else (e.g. transient catalog refresh warns)
-# On a streak >= THRESHOLD whose newest error is fresh (RECENT_MS), it
-# remediates at most once per MIN_INTERVAL seconds:
-#   1. 更换链路 — rotate the default egress to the healthiest OTHER pool exit
-#      (via /admin/settings/default-proxy, which live-applies + persists; when
-#      the gateway is not answering, edit ~/.op2gw/config.json directly),
-#   2. 重启网关 — launchctl kickstart -k of com.op2gw.gateway,
-#   3. 更新所有可用的免费模型 — POST /admin/catalog/refresh plus a full pool
-#      re-probe once the gateway is back.
+# On a streak >= THRESHOLD whose newest error is fresh (RECENT_MS), it runs ONE
+# rung of an escalating remediation ladder per trigger (MIN_INTERVAL cooldown
+# between triggers; the rung taken is remembered in logs/watchdog.state):
+#
+#   L1 重发会话 — force a pool probe round (revives flapping exits) and clear
+#      every sticky session binding (POST /admin/pool/pin id=none), so all
+#      conversations are re-dealt by the pool's round-robin across exits.
+#      Cheap: no process is touched. The OLD behaviour of re-pointing the
+#      default egress at a single "healthiest" exit is deliberately gone —
+#      pinning one exit funnels all traffic through one IP and recreates the
+#      per-IP 429 quota exhaustion this pool exists to avoid.
+#   L2 切换 v2ray 出口 IP — the streak survived L1, so the current egress IP
+#      set itself is burned: regenerate the xray sidecar node set EXCLUDING
+#      the addresses currently in use (scripts/xray-pool.mjs gen --exclude
+#      ...), kick com.op2gw.xraypool, verify the ports, and force a re-probe.
+#      op2gw keeps pointing at socks5://127.0.0.1:21001-21010 — only the
+#      nodes (egress IPs) behind those ports change.
+#   L3 重启网关 — the streak survived even fresh egress IPs: restart the
+#      gateway (launchctl kickstart -k), refresh the catalog, full pool
+#      probe, then reset the ladder to L1 for the next incident.
+#
 # Install: com.op2gw.watchdog.plist in ~/Library/LaunchAgents (StartInterval 60).
 #
 # Env overrides (for testing): OP2GW_WATCHDOG_LOG, OP2GW_WATCHDOG_THRESHOLD,
-# OP2GW_WATCHDOG_MIN_INTERVAL, OP2GW_WATCHDOG_RECENT_MS, OP2GW_WATCHDOG_DRY_RUN.
+# OP2GW_WATCHDOG_MIN_INTERVAL, OP2GW_WATCHDOG_RECENT_MS, OP2GW_WATCHDOG_DRY_RUN,
+# OP2GW_WATCHDOG_STATE, OP2GW_XRAY_SCRIPT, OP2GW_XRAY_CONFIG, OP2GW_XRAYPOOL_JOB.
 set -u
 
 ROOT="${OP2GW_ROOT:-$HOME/src/opencode2gw/op2gw}"
 LOG="${OP2GW_WATCHDOG_LOG:-$ROOT/logs/op2gw.log}"
-STATE="$ROOT/logs/watchdog.state"
+STATE="${OP2GW_WATCHDOG_STATE:-$ROOT/logs/watchdog.state}"
 CFG="$HOME/.op2gw/config.json"
+XRAY_CONFIG="${OP2GW_XRAY_CONFIG:-$HOME/.op2gw/xray-pool/config.json}"
+XRAY_SCRIPT="${OP2GW_XRAY_SCRIPT:-$ROOT/scripts/xray-pool.mjs}"
+XRAYPOOL_JOB="${OP2GW_XRAYPOOL_JOB:-com.op2gw.xraypool}"
 GW="http://127.0.0.1:8787"
 JOB="com.op2gw.gateway"
 THRESHOLD="${OP2GW_WATCHDOG_THRESHOLD:-5}"
@@ -36,6 +53,22 @@ say() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 gw_up() {
   [ "$(curl -s -m 5 -o /dev/null -w '%{http_code}' "$GW/v1/models" 2>/dev/null)" = "200" ]
+}
+
+# current rung: state file line 1 = last action ts, line 2 = last action rung.
+read_state() {
+  LAST_TS=0; LAST_RUNG=0
+  if [ -f "$STATE" ]; then
+    local t r
+    t=$(sed -n '1p' "$STATE" 2>/dev/null); r=$(sed -n '2p' "$STATE" 2>/dev/null)
+    case "$t" in (*[!0-9]*|"") t=0 ;; esac
+    case "$r" in (*[!0-9]*|"") r=0 ;; esac
+    LAST_TS=$t; LAST_RUNG=$r
+  fi
+}
+
+write_state() {
+  printf '%s\n%s\n' "$(date +%s)" "$1" > "$STATE" 2>/dev/null || true
 }
 
 # --- 1. trailing error streak -------------------------------------------------
@@ -71,98 +104,102 @@ if [ "${NEWEST:-0}" -eq 0 ] || [ $((now_ms - NEWEST)) -gt "$RECENT_MS" ]; then
 fi
 
 # --- 2. cooldown gate ---------------------------------------------------------
-if [ -f "$STATE" ]; then
-  last=$(head -n 1 "$STATE" 2>/dev/null || echo 0)
-  case "$last" in (*[!0-9]*|"") last=0 ;; esac
-  elapsed=$(( $(date +%s) - last ))
-  if [ "$elapsed" -lt "$MIN_INTERVAL" ]; then
-    say "streak=$STREAK but the last action was ${elapsed}s ago (< ${MIN_INTERVAL}s cooldown) — waiting"
+read_state
+elapsed=$(( $(date +%s) - LAST_TS ))
+if [ "$LAST_TS" -gt 0 ] && [ "$elapsed" -lt "$MIN_INTERVAL" ]; then
+  say "streak=$STREAK but the last action (L$LAST_RUNG) was ${elapsed}s ago (< ${MIN_INTERVAL}s cooldown) — waiting"
+  exit 0
+fi
+
+# Next rung: L1 first, then L2 if the streak survived L1, then L3 if it
+# survived L2; after L3 the ladder resets for the next incident.
+RUNG=$(( LAST_RUNG + 1 ))
+if [ "$RUNG" -gt 3 ]; then RUNG=1; fi
+
+say "ALERT: $STREAK consecutive errors (newest $(date -r $((NEWEST / 1000)) '+%H:%M:%S' 2>/dev/null)) — remediation L$RUNG (previous L$LAST_RUNG)"
+
+# A dead gateway skips the API-based rungs entirely: restart is the only lever.
+if ! gw_up && [ "$RUNG" -lt 3 ]; then
+  say "gateway is not answering — escalating straight to L3"
+  RUNG=3
+fi
+
+# --- L1: 重发会话 — re-probe exits + clear sticky bindings --------------------
+if [ "$RUNG" = "1" ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    say "DRY-RUN: would force a pool probe round and clear all sticky session bindings"
+  else
+    curl -s -m 10 -X POST "$GW/admin/pool/probe" -o /dev/null -w "pool probe: %{http_code}\n"
+    curl -s -m 10 -X POST "$GW/admin/pool/pin" -H 'content-type: application/json' \
+      -d '{"id":"none"}' -o /dev/null -w "sticky cleared (pin stays off): %{http_code}\n"
+    say "L1 done: exits re-verified, every session re-dealt by round-robin"
+  fi
+  [ "$DRY_RUN" != "1" ] && write_state 1
+  say "remediation complete (L1)"
+  exit 0
+fi
+
+# --- L2: 切换 v2ray 出口 IP — regenerate the sidecar with fresh nodes ---------
+if [ "$RUNG" = "2" ]; then
+  if [ "$DRY_RUN" = "1" ]; then
+    say "DRY-RUN: would regenerate $XRAY_CONFIG excluding the current node addresses and restart $XRAYPOOL_JOB"
     exit 0
   fi
-fi
-
-say "ALERT: $STREAK consecutive errors (newest $(date -r $((NEWEST / 1000)) '+%H:%M:%S' 2>/dev/null)) — remediating"
-
-# --- 3. 更换链路: default egress -> healthiest other exit ---------------------
-NEXT=$(node --input-type=module -e '
+  CUR=$(node --input-type=module -e '
 import { readFileSync } from "node:fs"
-let cfg = {}
-try { cfg = JSON.parse(readFileSync(process.argv[1], "utf8")) } catch { console.log(""); process.exit(0) }
-const cur = cfg.proxy || ""
-const others = (cfg.pool?.manual ?? []).filter((u) => u !== cur)
-if (others.length === 0) { console.log(""); process.exit(0) }
-let status = null
 try {
-  status = await fetch("http://127.0.0.1:8787/admin/status", { signal: AbortSignal.timeout(4000) }).then((r) => r.json())
-} catch {}
-const health = new Map((status?.pool?.exits ?? []).map((e) => [e.id, e]))
-const rank = (u) => {
-  const h = health.get(u)
-  if (!h || h.cooling) return 2
-  if (h.state === "ok") return 0
-  if (h.state !== "dead") return 1
-  return 2
-}
-others.sort((a, b) => rank(a) - rank(b))
-console.log(others[0] ?? "")
-' "$CFG")
-
-if [ -n "$NEXT" ]; then
-  if [ "$DRY_RUN" = "1" ]; then
-    say "DRY-RUN: would switch the default egress link -> $NEXT"
+  const cfg = JSON.parse(readFileSync(process.argv[1], "utf8"))
+  const addrs = (cfg.outbounds ?? [])
+    .map((o) => o.settings?.vnext?.[0]?.address)
+    .filter(Boolean)
+  console.log([...new Set(addrs)].join(","))
+} catch { console.log("") }
+' "$XRAY_CONFIG")
+  if [ -z "$CUR" ]; then
+    say "WARN: could not read current sidecar nodes from $XRAY_CONFIG — falling back to L3"
+    RUNG=3
   else
-    code=$(curl -s -m 10 -X POST "$GW/admin/settings/default-proxy" \
-      -H 'content-type: application/json' -d "{\"uri\": \"$NEXT\"}" \
-      -o /dev/null -w '%{http_code}' 2>/dev/null)
-    if [ "$code" = "200" ]; then
-      say "link switched (live-applied + persisted) -> $NEXT"
-    else
-      if node --input-type=module -e '
-import { readFileSync, writeFileSync } from "node:fs"
-const [cfgPath, uri] = process.argv.slice(1)
-const cfg = JSON.parse(readFileSync(cfgPath, "utf8"))
-cfg.proxy = uri
-writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + "\n")
-' "$CFG" "$NEXT" 2>/dev/null; then
-        say "gateway not answering (code=$code); new link written to config.json -> $NEXT"
-      else
-        say "WARN: could not switch the link (api code=$code, config edit failed) — restarting with the current link"
-      fi
+    say "rotating v2ray egress IPs: excluding $(echo "$CUR" | tr ',' ' ' | wc -w | tr -d ' ') current nodes"
+    if node "$XRAY_SCRIPT" gen --count 10 --base-port 21001 --exclude "$CUR" --out "$XRAY_CONFIG" >> /dev/null 2>&1; then
+      launchctl kickstart -k "gui/$(id -u)/$XRAYPOOL_JOB" 2>/dev/null \
+        || launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$XRAYPOOL_JOB.plist" 2>/dev/null
+      sleep 6
+      node "$XRAY_SCRIPT" verify --count 10 --base-port 21001 --timeout 10000 || true
+      curl -s -m 10 -X POST "$GW/admin/pool/probe" -o /dev/null -w "pool probe: %{http_code}\n"
+      say "L2 done: sidecar regenerated behind unchanged ports 21001-21010, exits re-probing"
+      write_state 2
+      say "remediation complete (L2)"
+      exit 0
     fi
-  fi
-else
-  say "no alternative exit in the manual pool — keeping the current link"
-fi
-
-# --- 4. 重启网关 --------------------------------------------------------------
-if [ "$DRY_RUN" = "1" ]; then
-  say "DRY-RUN: would restart launchd job $JOB"
-else
-  say "restarting launchd job $JOB"
-  if ! launchctl kickstart -k "gui/$(id -u)/$JOB" 2>/dev/null; then
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$JOB.plist" 2>/dev/null
-    launchctl kickstart -k "gui/$(id -u)/$JOB" 2>/dev/null || say "WARN: restart command failed"
-  fi
-  up=0
-  for _ in $(seq 1 60); do
-    if gw_up; then up=1; break; fi
-    sleep 2
-  done
-  if [ "$up" = "1" ]; then
-    say "gateway is back (v1/models 200)"
-  else
-    say "WARN: gateway did not come back within 120s — launchd will keep retrying"
+    say "WARN: sidecar regeneration failed — falling back to L3"
+    RUNG=3
   fi
 fi
 
-# --- 5. 更新所有可用的免费模型 + 全量复探出口 ----------------------------------
+# --- L3: 重启网关 — last resort, then reset the ladder ------------------------
 if [ "$DRY_RUN" = "1" ]; then
-  say "DRY-RUN: would refresh the catalog and re-probe the pool"
+  say "DRY-RUN: would restart launchd job $JOB and refresh catalog + pool"
+  exit 0
+fi
+say "restarting launchd job $JOB"
+if ! launchctl kickstart -k "gui/$(id -u)/$JOB" 2>/dev/null; then
+  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$JOB.plist" 2>/dev/null
+  launchctl kickstart -k "gui/$(id -u)/$JOB" 2>/dev/null || say "WARN: restart command failed"
+fi
+up=0
+for _ in $(seq 1 60); do
+  if gw_up; then up=1; break; fi
+  sleep 2
+done
+if [ "$up" = "1" ]; then
+  say "gateway is back (v1/models 200)"
 else
-  curl -s -m 30 -X POST "$GW/admin/catalog/refresh" -o /dev/null -w 'catalog refresh: %{http_code}\n'
-  curl -s -m 10 -X POST "$GW/admin/pool/probe" -o /dev/null -w 'pool probe: %{http_code}\n'
-  sleep 15
-  curl -s -m 5 "$GW/admin/status" | node -e '
+  say "WARN: gateway did not come back within 120s — launchd will keep retrying"
+fi
+curl -s -m 30 -X POST "$GW/admin/catalog/refresh" -o /dev/null -w 'catalog refresh: %{http_code}\n'
+curl -s -m 10 -X POST "$GW/admin/pool/probe" -o /dev/null -w 'pool probe: %{http_code}\n'
+sleep 15
+curl -s -m 5 "$GW/admin/status" | node -e '
 let d = ""
 process.stdin.on("data", (c) => (d += c)).on("end", () => {
   try {
@@ -171,9 +208,5 @@ process.stdin.on("data", (c) => (d += c)).on("end", () => {
     console.log(`post-action state: catalog=${s.catalog.status} exposed=${s.catalog.exposed} exits=[${exits}]`)
   } catch { console.log("post-action state: unreadable") }
 })'
-fi
-
-if [ "$DRY_RUN" != "1" ]; then
-  date +%s > "$STATE"
-fi
-say "remediation complete"
+write_state 0
+say "remediation complete (L3, ladder reset)"
