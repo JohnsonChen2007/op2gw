@@ -313,3 +313,21 @@ test('unknown admin routes 404', async () => {
     await rt.stop()
   }
 })
+
+test('POST /admin/pool/probe actually forces a verification round', async () => {
+  // The route used to call the free-source refresher instead, so the debug UI's
+  // probe button refreshed a list and never verified a single tunnel — leaving
+  // an operator with no manual way to revive a dead pool.
+  const rt = await makeRuntime()
+  try {
+    let probes = 0
+    rt.forceProbe = (): void => {
+      probes += 1
+    }
+    const { status } = await call(rt, '/admin/pool/probe', {}, 'POST')
+    assert.equal(status, 200)
+    assert.equal(probes, 1, 'the probe button must run the prober, not the source fetch')
+  } finally {
+    await rt.stop()
+  }
+})

@@ -135,3 +135,89 @@ test('start/stop manages the timer without double-starting', async () => {
   healer.stop()
   assert.ok(catalog.refreshes >= 0, 'timer ran without throwing')
 })
+
+test('a degraded pool kicks the recovery callback from an idle gateway', async () => {
+  // Degradation is a recovery trigger, not just a status line. The gateway's own
+  // kick only fires when a client request arrives, so without this the same
+  // warning would be logged forever while nothing was ever attempted.
+  const dir = await tempDir()
+  const cfg = defaultConfig()
+  cfg.dataDir = dir
+  cfg.pool.enabled = true
+  cfg.pool.includeDirect = false
+  const pool = new ExitPool()
+  pool.setIncludeDirect(false)
+  pool.add({
+    id: 'http://dead:1',
+    kind: 'http',
+    source: 'manual',
+    pinned: false,
+    exitIP: '',
+    location: '',
+    latencyMs: 0,
+  })
+  pool.markProbe('http://dead:1', false, 0)
+  let kicks = 0
+  const healer = new SelfHealer({
+    logger: quietScope(),
+    catalog: catalogDouble(0) as never,
+    pool,
+    config: cfg,
+    onPoolStarved: () => {
+      kicks += 1
+    },
+  })
+  await healer.tick()
+  assert.equal(kicks, 1, 'the tick acts on the degradation')
+})
+
+test('a healthy pool never fires the recovery callback', async () => {
+  const dir = await tempDir()
+  const cfg = defaultConfig()
+  cfg.dataDir = dir
+  cfg.pool.enabled = true
+  const pool = new ExitPool()
+  pool.add({
+    id: 'http://alive:1',
+    kind: 'http',
+    source: 'manual',
+    pinned: false,
+    exitIP: '',
+    location: '',
+    latencyMs: 0,
+  })
+  let kicks = 0
+  const healer = new SelfHealer({
+    logger: quietScope(),
+    catalog: catalogDouble(0) as never,
+    pool,
+    config: cfg,
+    onPoolStarved: () => {
+      kicks += 1
+    },
+  })
+  await healer.tick()
+  assert.equal(kicks, 0, 'no recovery work when an exit is usable')
+})
+
+test('a throwing recovery callback cannot take down the tick', async () => {
+  const dir = await tempDir()
+  const cfg = defaultConfig()
+  cfg.dataDir = dir
+  cfg.pool.enabled = true
+  cfg.pool.includeDirect = false
+  const pool = new ExitPool()
+  pool.setIncludeDirect(false)
+  const healer = new SelfHealer({
+    logger: quietScope(),
+    catalog: catalogDouble(0) as never,
+    pool,
+    config: cfg,
+    onPoolStarved: () => {
+      throw new Error('recovery wiring is broken')
+    },
+  })
+  await healer.tick()
+  const status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8')) as { poolEnabled: boolean }
+  assert.equal(status.poolEnabled, true, 'the tick still completed and wrote its snapshot')
+})
