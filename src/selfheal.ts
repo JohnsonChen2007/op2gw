@@ -13,8 +13,11 @@ import type { ExitPool } from './pool/pool.js'
  * Checks each tick:
  *   - Catalog stale (last successful S1 older than catalogStaleMs) -> force a
  *     refresh. If it stays empty, the gateway still serves the S3 static list.
- *   - Pool has no usable exit for a probe model while enabled -> re-probe due
- *     exits immediately and log a degraded warning.
+ *   - Pool has no usable exit while enabled -> log the degradation and kick the
+ *     recovery callback (onPoolStarved), which force-verifies every exit and
+ *     tops the pool up. The gateway's own kick fires only when a client request
+ *     arrives, so without this an idle gateway would log the outage forever and
+ *     never act on it.
  *   - Direct exit accidentally marked dead but pool disabled -> revive it (a
  *     transient network blip must not permanently kill the only exit).
  *   - Writes a status.json health snapshot for external monitoring.
@@ -27,6 +30,15 @@ export interface SelfHealDeps {
   config: Op2gwConfig
   intervalMs?: number
   now?: () => number
+  /**
+   * Fired when the pool has no usable exit. The runtime wires this to its
+   * recovery routine (force-verify every exit, top up from the free sources).
+   *
+   * Without it this class only ever LOGGED the degradation: the gateway's own
+   * kick fires solely when a client request arrives, so a pool that died while
+   * the gateway sat idle stayed dead indefinitely.
+   */
+  onPoolStarved?: () => void
 }
 
 export class SelfHealer {
@@ -89,6 +101,18 @@ export class SelfHealer {
           ? 'pool degraded: no usable exit; direct is the floor'
           : 'pool degraded: no usable proxy exit and direct egress is disallowed; requests will be refused',
       )
+      // Degradation is a recovery trigger, not just a status line. The gateway
+      // only kicks recovery when a client request actually arrives, so without
+      // this an idle gateway would log the same warning forever and never act
+      // on it. The callback owns its own error handling; this guard just keeps
+      // a faulty one from taking down the whole tick.
+      try {
+        this.#d.onPoolStarved?.()
+      } catch (err) {
+        this.#d.logger.warn('pool recovery kick failed', {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      }
     }
   }
 

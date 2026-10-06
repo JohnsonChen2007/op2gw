@@ -113,8 +113,11 @@ export async function handleAdmin(
   }
 
   if (path === '/admin/pool/probe' && method === 'POST') {
-    void runtime.refreshFreePool()
-    runtime.logger.child('admin').info('manual probe/refresh triggered')
+    // Force-verify every exit right now. This route used to call the free-source
+    // refresher, so the debug UI's "probe" button never probed anything and an
+    // operator had no manual way to revive a dead pool.
+    runtime.forceProbe()
+    runtime.logger.child('admin').info('forced probe round triggered')
     return json(res, 200, { ok: true })
   }
 

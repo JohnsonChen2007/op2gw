@@ -82,10 +82,18 @@ export class Prober {
 
   start(intervalMs: number): void {
     if (this.#timer) return
-    this.#timer = setInterval(() => void this.tick(), intervalMs)
+    this.#timer = setInterval(() => {
+      void this.tick().catch((err) => {
+        this.#logger.warn('probe round failed', { error: err instanceof Error ? err.message : String(err) })
+      })
+    }, intervalMs)
     this.#timer.unref?.()
     // Kick an immediate round so fresh exits get an admission verdict fast.
-    void this.tick()
+    // Caught explicitly: this is fire-and-forget, and one escaped rejection
+    // would surface as an unhandledRejection and take the process down.
+    void this.tick().catch((err) => {
+      this.#logger.warn('initial probe round failed', { error: err instanceof Error ? err.message : String(err) })
+    })
   }
 
   stop(): void {

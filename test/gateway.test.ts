@@ -125,6 +125,7 @@ function makeGateway(
     maxRotateAttempts?: number
     freeModels?: string[]
     onPoolStarved?: () => void
+    bodyBudgetMs?: number
   } = { poolEnabled: false },
 ): GatewayHarness {
   const logger = new Logger({ level: 'error', stdout: false, capacity: 50, traceCapacity: 50 })
@@ -161,6 +162,7 @@ function makeGateway(
     maxRotateAttempts: opts.maxRotateAttempts ?? 3,
     poolEnabled: opts.poolEnabled,
     onPoolStarved: opts.onPoolStarved,
+    bodyBudgetMs: opts.bodyBudgetMs,
   })
   const cleanup = async (): Promise<void> => {
     await dispatchers.destroy().catch(() => {})

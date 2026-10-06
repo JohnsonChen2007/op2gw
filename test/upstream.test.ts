@@ -2,7 +2,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 
-import { classifyStatus, classifyTransport, wrapWatchdog } from '../dist/gateway/upstream.js'
+import {
+  classifyStatus,
+  classifyTransport,
+  parseRetryAfter,
+  wrapDeadline,
+  wrapWatchdog,
+} from '../dist/gateway/upstream.js'
 
 /**
  * Upstream classifier + watchdog tests. The classifiers drive the pool's
@@ -84,4 +90,63 @@ test('wrapWatchdog fires the body-idle timeout between chunks', async () => {
 test('wrapWatchdog tolerates chunks inside the idle window', async () => {
   const out = wrapWatchdog(tickingSource(['a', 'b', 'c'], 10), 1000, 500)
   assert.equal(await collect(out), 'abc')
+})
+
+test('parseRetryAfter reads delta-seconds and HTTP-dates, and caps both', () => {
+  assert.equal(parseRetryAfter('5'), 5000)
+  assert.equal(parseRetryAfter('0'), undefined, 'zero means retry now')
+  assert.equal(parseRetryAfter('-30'), undefined, 'negative is meaningless')
+  assert.equal(parseRetryAfter(undefined), undefined)
+  assert.equal(parseRetryAfter('not-a-date'), undefined)
+
+  const now = Date.UTC(2026, 9, 6, 0, 0, 0)
+  const at = new Date(now + 30_000).toUTCString()
+  assert.equal(parseRetryAfter(at, now), 30_000, 'HTTP-date form')
+
+  // A hostile value must not park an exit in cooldown for hours.
+  assert.equal(parseRetryAfter('999999'), 5 * 60_000)
+})
+
+test('wrapDeadline returns the source untouched when the budget is disabled', () => {
+  const source = Readable.from(['x'])
+  assert.equal(wrapDeadline(source, 0), source)
+})
+
+test('wrapDeadline passes a stream that finishes inside the budget', async () => {
+  const out = wrapDeadline(tickingSource(['a', 'b', 'c'], 10), 2000)
+  assert.equal(await collect(out), 'abc')
+})
+
+test('wrapDeadline bounds a non-streaming body that never ends', async () => {
+  // The non-streaming path deliberately has NO idle watchdog (a slow reasoning
+  // model may go quiet for minutes), so this total budget is the only thing
+  // between a half-open upstream and a request that never returns.
+  const source = Readable.from(
+    (async function* () {
+      yield 'head'
+      await new Promise((r) => setTimeout(r, 5000))
+      yield 'never reached'
+    })(),
+  )
+  const out = wrapDeadline(source, 60)
+  await assert.rejects(collect(out), /budget/)
+})
+
+test('wrapDeadline releases the upstream when its consumer walks away', async () => {
+  let released = false
+  const source = new Readable({
+    read() {},
+  })
+  source.on('close', () => {
+    released = true
+  })
+  const out = wrapDeadline(source, 60_000)
+  source.push('chunk')
+  // A plain destroy — no error — because nothing is consuming `out` here.
+  // Passing an error would trip Node's "destroyed without error listener"
+  // guard and fail the test for the wrong reason; the behaviour under test is
+  // that dropping the consumer releases the upstream, not what `out` throws.
+  out.destroy()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(released, true, 'an abandoned read must not keep the upstream pinned open')
 })

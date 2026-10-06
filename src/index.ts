@@ -16,6 +16,7 @@ import {
   messagesToChatBody,
   toAnthropicErrorBody,
 } from './gateway/anthropic.js'
+import { clientStreamErrorBody, withInBandError, type ClientDialect } from './gateway/clienterror.js'
 
 /**
  * op2gw HTTP server.
@@ -80,7 +81,12 @@ async function main(): Promise<void> {
     }
 
     if (path === '/healthz') {
-      json(res, 200, { status: 'ok', version: VERSION, catalog: runtime.catalog.snapshot() })
+      // 503 when nothing can serve: a monitor must be able to tell "the
+      // process is up" from "the process is up but every exit is cooling,
+      // dead or banned" — the old always-200 reply hid exactly the outage
+      // self-heal exists to detect.
+      const health = runtime.health()
+      json(res, health.status === 'degraded' ? 503 : 200, health)
       return
     }
 
@@ -133,29 +139,34 @@ async function main(): Promise<void> {
     }
     const clientStream = body.stream === true
     const abort = new AbortController()
-    req.on('close', () => abort.abort())
+    abortOnClientGone(res, abort)
 
     const gatewayReq: GatewayRequest = { api, body, clientStream, signal: abort.signal }
     try {
       const result = await runtime.gateway.handle(gatewayReq)
       res.writeHead(result.status, result.headers)
-      await pipeline(result.body, res)
+      // The wrapper turns a mid-stream failure into a terminal in-band event.
+      // `pipeline` destroys `res` as soon as its source errors, so the catch
+      // below would otherwise have nothing left to write to.
+      await pipeline(withInBandError(result.body, api), res)
     } catch (err) {
+      // The client already left: nothing to answer, and writing to a dead
+      // socket only risks a spurious error event.
+      if (abort.signal.aborted || res.destroyed) return
+      const message = err instanceof Error ? err.message : String(err)
       if (err instanceof GatewayHttpError) {
         if (!res.headersSent) {
           res.writeHead(err.status, { 'content-type': 'application/json; charset=utf-8' })
           res.end(err.toOpenAIBody())
         } else {
-          res.end()
+          endWithStreamFailure(res, api, err.message)
         }
         return
       }
-      // Client aborted mid-stream, or a stream error after headers.
-      const message = err instanceof Error ? err.message : String(err)
       if (!res.headersSent) {
         json(res, 502, { error: { message, type: 'upstream_error' } })
       } else {
-        res.end()
+        endWithStreamFailure(res, api, message)
       }
     }
   }
@@ -185,7 +196,7 @@ async function main(): Promise<void> {
     const chatBody = messagesToChatBody(body)
     const clientStream = body.stream === true
     const abort = new AbortController()
-    req.on('close', () => abort.abort())
+    abortOnClientGone(res, abort)
 
     // `api: 'chat'` — the gateway's client dialect. From here on this is an
     // ordinary OpenAI chat request; the Anthropic shape only reappears on the
@@ -195,7 +206,7 @@ async function main(): Promise<void> {
       const result = await runtime.gateway.handle(gatewayReq)
       if (clientStream) {
         res.writeHead(result.status, result.headers)
-        await pipeline(chatToMessagesStream(result.body, requestedModel), res)
+        await pipeline(withInBandError(chatToMessagesStream(result.body, requestedModel), 'anthropic'), res)
         return
       }
       // Non-streaming: the gateway returns a single chat-completion object.
@@ -227,12 +238,15 @@ async function main(): Promise<void> {
       res.writeHead(result.status, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify(message))
     } catch (err) {
+      // The client already left: nothing to answer, and writing to a dead
+      // socket only risks a spurious error event.
+      if (abort.signal.aborted || res.destroyed) return
       if (err instanceof GatewayHttpError) {
         if (!res.headersSent) {
           res.writeHead(err.status, { 'content-type': 'application/json; charset=utf-8' })
           res.end(toAnthropicErrorBody(err.message, err.type))
         } else {
-          res.end()
+          endWithStreamFailure(res, 'anthropic', err.message)
         }
         return
       }
@@ -241,7 +255,7 @@ async function main(): Promise<void> {
         res.writeHead(502, { 'content-type': 'application/json; charset=utf-8' })
         res.end(toAnthropicErrorBody(message, 'api_error'))
       } else {
-        res.end()
+        endWithStreamFailure(res, 'anthropic', message)
       }
     }
   }
@@ -300,6 +314,43 @@ function checkAuth(req: IncomingMessage, keys: Set<string>): boolean {
   return match ? keys.has(match[1]!.trim()) : false
 }
 
+/**
+ * Abort the request signal when the CLIENT walks away before the response is
+ * finished.
+ *
+ * Watching `IncomingMessage` here does not work: it emits `close` the moment the
+ * request body has been consumed, which is before this listener can be attached
+ * (the body is always read first, and `close` is emitted on the next tick). The
+ * listener therefore never ran and the abort never fired — a disconnect left the
+ * gateway grinding through an upstream call nobody was waiting for. The
+ * RESPONSE closes exactly once, and `writableEnded` separates a completed
+ * response from a dropped connection, so that is the signal to watch.
+ */
+function abortOnClientGone(res: ServerResponse, abort: AbortController): void {
+  res.on('close', () => {
+    if (!res.writableEnded) abort.abort()
+  })
+}
+
+/**
+ * Emit a terminal in-band failure on a stream whose headers are already out,
+ * then close it. Without this the client sees a stream that stops without any
+ * terminator and can mistake a truncated answer for a complete one.
+ */
+function endWithStreamFailure(res: ServerResponse, dialect: ClientDialect, message: string): void {
+  if (res.destroyed || res.writableEnded) return
+  try {
+    res.write(clientStreamErrorBody(dialect, message))
+  } catch {
+    // socket went away mid-write; nothing left to do
+  }
+  try {
+    res.end()
+  } catch {
+    // already closed
+  }
+}
+
 function unauthorized(res: ServerResponse): void {
   json(res, 401, { error: { message: 'missing or invalid API key', type: 'invalid_request_error' } })
 }
@@ -308,6 +359,28 @@ function unauthorizedAnthropic(res: ServerResponse): void {
   res.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'www-authenticate': 'Bearer' })
   res.end(toAnthropicErrorBody('missing or invalid API key', 'authentication_error'))
 }
+
+/**
+ * Last-resort process guards.
+ *
+ * Nothing else in this server installs them, and several subsystems are started
+ * fire-and-forget (`void catalog.start()`, `void prober.tick(...)`, `void
+ * refreshFreePool()`): one rejection escaping them would take the whole gateway
+ * down in the middle of serving requests. Logging and continuing is the right
+ * trade here — the call that triggered it fails on its own, the process keeps
+ * serving, and the supervisor never has to step in.
+ *
+ * This is a safety net, not a substitute for supervision: a genuine crash that
+ * leaves the process unusable still needs systemd / launchd / a container
+ * restart policy to bring it back.
+ */
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`op2gw uncaughtException: ${err.stack ?? err.message}\n`)
+})
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason))
+  process.stderr.write(`op2gw unhandledRejection: ${err.stack ?? err.message}\n`)
+})
 
 main().catch((err) => {
   process.stderr.write(`op2gw fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}\n`)

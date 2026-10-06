@@ -1217,9 +1217,32 @@ function failResponses(ctx: ResponsesCtx, failure: UpstreamFailure): string[] {
   return out
 }
 
+/**
+ * Find a failure hidden inside a successful chat SSE body: an event carrying an
+ * `error` object where `choices` should be. A chunk that carries BOTH is still
+ * content (an error alongside real deltas) and is ignored, matching the
+ * aggregator's rule. Returns the message, or null for a normal completion.
+ */
+function chatInBodyFailure(events: Json[]): string | null {
+  for (const evt of events) {
+    if (!isRecord(evt)) continue
+    const err = evt.error
+    if (!isRecord(err)) continue
+    if (Array.isArray(evt.choices)) continue
+    if (typeof err.message === 'string') return err.message
+  }
+  return null
+}
+
 /** Aggregate a chat-completions SSE stream into a single responses JSON body. */
 export async function chatToResponsesCompletion(source: Readable, model: string): Promise<Readable> {
   const events = await collectSseObjects(source)
+  // A chat-shaped HTTP 200 can carry an error object where `choices` should be
+  // (the upstream's habit of wrapping a 503 in a chat chunk). Converting it to
+  // a throw keeps the gateway from answering with an empty "completed" response
+  // — and lets the failure reach the rotation loop like any other exit failure.
+  const failure = chatInBodyFailure(events)
+  if (failure) throw new Error(failure)
   const ctx = newResponsesCtx(model)
   for (const evt of events) for (const line of chatEventToResponses(ctx, evt)) void line
   if (!ctx.finished) finishResponses(ctx, 'stop')

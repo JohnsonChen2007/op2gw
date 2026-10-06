@@ -30,6 +30,13 @@ export interface Op2gwConfig {
   metadataUrl: string
   /** Live catalog refresh cadence (seconds). */
   refreshSeconds: number
+  /**
+   * Hard wall-clock budget (ms) for reading a NON-STREAMING response body.
+   * That path deliberately skips the idle watchdog (a slow reasoning model may
+   * go quiet for minutes), so without this a half-open upstream would hang the
+   * request forever. Streaming is unaffected. 0 disables the budget.
+   */
+  bodyBudgetMs: number
   /** Log level. */
   logLevel: LogLevel
   /**
@@ -94,6 +101,10 @@ export function defaultConfig(): Op2gwConfig {
     zenBaseUrl: 'https://opencode.ai/zen',
     metadataUrl: 'https://models.dev/api.json',
     refreshSeconds: 300,
+    // Generous: this only has to be shorter than "forever". A non-streaming
+    // turn legitimately takes minutes, so 10 minutes bounds a hung upstream
+    // without ever cutting off a real answer.
+    bodyBudgetMs: 10 * 60_000,
     logLevel: 'info',
     proxy: '',
     dataDir,
@@ -172,6 +183,7 @@ export async function loadConfig(argv: string[] = process.argv.slice(2)): Promis
   cfg.port = coerceNum(env.OP2GW_PORT, cfg.port)
   cfg.zenBaseUrl = env.OP2GW_ZEN_URL ?? cfg.zenBaseUrl
   cfg.refreshSeconds = coerceNum(env.OP2GW_REFRESH_SECONDS, cfg.refreshSeconds)
+  cfg.bodyBudgetMs = coerceNum(env.OP2GW_BODY_BUDGET_MS, cfg.bodyBudgetMs)
   cfg.logLevel = (env.OP2GW_LOG_LEVEL as LogLevel) ?? cfg.logLevel
   cfg.dataDir = env.OP2GW_DATA_DIR ?? cfg.dataDir
 
@@ -229,6 +241,7 @@ export async function saveConfig(cfg: Op2gwConfig): Promise<string> {
     apiKeys: cfg.apiKeys,
     zenBaseUrl: cfg.zenBaseUrl,
     refreshSeconds: cfg.refreshSeconds,
+    bodyBudgetMs: cfg.bodyBudgetMs,
     logLevel: cfg.logLevel,
     proxy: cfg.proxy,
     pool: cfg.pool,

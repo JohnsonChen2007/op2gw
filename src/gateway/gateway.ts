@@ -21,6 +21,16 @@ import {
   stripCallerBoundReasoning,
 } from './protocol.js'
 
+/** Ceiling for any single rotation backoff (Retry-After included). */
+const MAX_BACKOFF_MS = 4_000
+/**
+ * Default hard budget for reading a non-streaming response body. That path has
+ * no idle watchdog by design, so this is the only thing standing between a
+ * half-open upstream and a request that never returns. Generous enough that a
+ * slow reasoning model is never cut off mid-answer.
+ */
+const DEFAULT_BODY_BUDGET_MS = 10 * 60_000
+
 /**
  * Gateway — the request orchestrator.
  *
@@ -59,6 +69,13 @@ export interface GatewayDeps {
    * probe interval / dead-exit recheck window.
    */
   onPoolStarved?: () => void
+  /**
+   * Hard wall-clock budget (ms) for reading a NON-STREAMING response body.
+   * That path deliberately skips the idle watchdog (a reasoning model may go
+   * quiet for minutes), so without this a half-open upstream would hang the
+   * request forever. 0 disables the budget. Defaults to 10 minutes.
+   */
+  bodyBudgetMs?: number
 }
 
 export interface GatewayRequest {
@@ -131,6 +148,8 @@ export class Gateway {
       : 1
     const story: string[] = []
     let lastError: UpstreamError | Error | null = null
+    /** Set when the CLIENT disconnected mid-request (as opposed to upstream failure). */
+    let clientGone = false
     const triedExits = new Set<string>()
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -175,24 +194,31 @@ export class Gateway {
           bodyIdleMs: wireApi === 'responses' ? 300_000 : 120_000,
           firstByteMs: 30_000,
           noWatchdog: !req.clientStream,
+          bodyTotalMs: req.clientStream ? 0 : (this.#d.bodyBudgetMs ?? DEFAULT_BODY_BUDGET_MS),
         })
-        // Response headers landed = success from the pool's view; the body may
-        // still error mid-stream, but we do not rotate once bytes are flowing
-        // (a partially delivered stream must never be replayed).
-        this.#d.pool.markSuccess(exit.id, model)
-        // The upstream can answer HTTP 200 and still put an error object inside
-        // the SSE body (observed on nemotron-3-ultra-free: an Nvidia 503 wrapped
-        // as a chat chunk). That is a failure, not an empty answer: it must not
-        // be marked as a model success, and a Responses client must be told.
+
+        // Validate the body BEFORE recording success. An HTTP 200 can still
+        // carry a failure — an SSE error object ahead of any content, or (for a
+        // non-streaming client) an error object anywhere in the aggregated body.
+        // Both must reach the rotation loop below, and neither may reset the
+        // exit's health as though the call had succeeded (recording success
+        // first zeroed `consecutiveLimited`, so429 backoff could never
+        // accumulate).
         //
-        // Streaming only: the peek consumes the head of `result.body` and replays
-        // it. In no-watchdog (non-streaming) mode body === rawBody, so peeking
-        // here would steal the first chunk from the aggregator below. The
-        // aggregators (aggregateSse / *Completion) detect in-body errors
-        // themselves, so non-streaming clients skip this step.
+        // Streaming only peeks: once bytes have been delivered we must not
+        // rotate, because a partially delivered stream can never be replayed.
+        let body: Readable
         if (req.clientStream) {
           await this.#inspectPreContentError(wireApi, result, model, exit.id, log)
+          body = this.#toClientStream(req.api, wireApi, result.body, model)
+        } else {
+          // Aggregation throws an UpstreamError on an in-body error, so a
+          // non-streaming client gets a real status code and a retry instead of
+          // HTTP 200 wrapping an error object.
+          body = await this.#toClientCompletion(req.api, wireApi, result.rawBody, model)
         }
+
+        this.#d.pool.markSuccess(exit.id, model)
         const trace: RequestTrace = {
           id: requestId,
           ts: started,
@@ -207,12 +233,21 @@ export class Gateway {
         }
         this.#d.logger.trace(trace)
         log.info('request ok', { model, exit: exit.id, attempt, stream: req.clientStream, api: wireApi, clientApi: req.api })
-        const body = req.clientStream
-          ? await this.#toClientStream(req.api, wireApi, result.body, model)
-          : await this.#toClientCompletion(req.api, wireApi, result.rawBody, model)
         return { status: 200, headers: this.#responseHeaders(req.clientStream), body, trace }
       } catch (err) {
         lastError = err as Error
+
+        // The client walked away. `req.signal` only fires on a real disconnect,
+        // so this failure is ours to absorb: the exit did nothing wrong, and
+        // rotating would keep spending the budget on a request nobody is
+        // waiting for. Bail out without touching pool health.
+        if (req.signal?.aborted) {
+          clientGone = true
+          story.push(`#${attempt} ${exit.id} client_closed: disconnect before completion`)
+          log.warn('client disconnected; abandoning request', { model, exit: exit.id, attempt })
+          break
+        }
+
         const kind = (err as UpstreamError).kind ?? 'transport'
         const status = (err as UpstreamError).status
         // A 400 from upstream is a client/request validation error (e.g. invalid param,
@@ -245,11 +280,40 @@ export class Gateway {
         }
         // Break the sticky binding so the next pick moves to a fresh exit.
         this.#d.pool.rerouteSession(ids.session)
-        // Brief backoff before rotating to give overloaded upstreams or rate-limited tunnels a moment.
-        if (kind === 'server' || kind === 'limited') {
-          await new Promise((resolve) => setTimeout(resolve, Math.min(attempt * 400, 1500)))
+        // Backoff before rotating, so an overloaded upstream or a rate-limited
+        // tunnel gets a moment. A `Retry-After` from the upstream is
+        // authoritative and wins; otherwise use full-jitter exponential backoff
+        // (uniform in [0, base)) so a burst of concurrent failures does not
+        // retry in lockstep and land on the recovering upstream all at once —
+        // the fixed delay it replaces made every in-flight request retry
+        // simultaneously.
+        const retryAfterMs = (err as UpstreamError).retryAfterMs
+        if (retryAfterMs !== undefined && retryAfterMs > 0) {
+          await sleep(Math.min(retryAfterMs, MAX_BACKOFF_MS))
+        } else if (kind === 'server' || kind === 'limited') {
+          await sleep(Math.floor(Math.random() * Math.min(400 * 2 ** (attempt - 1), MAX_BACKOFF_MS)))
         }
       }
+    }
+
+    // The client disconnected: nothing left to serve, and the pool was
+    // deliberately left untouched. Trace it, then report 499 (client closed
+    // request) so the HTTP layer knows not to write a body at a dead socket.
+    if (clientGone) {
+      this.#d.logger.trace({
+        id: requestId,
+        ts: started,
+        model,
+        stream: req.clientStream,
+        status: 499,
+        exit: '',
+        exitIP: '',
+        attempts: Math.max(1, triedExits.size),
+        durationMs: Date.now() - started,
+        outcome: 'error',
+        error: 'client closed the connection',
+      })
+      throw new GatewayHttpError(499, 'client_closed_request', 'client closed the connection')
     }
 
     // All attempts exhausted.
@@ -392,10 +456,17 @@ export class Gateway {
     source: Readable,
     model: string,
   ): Promise<Readable> {
-    if (clientApi === wireApi) return aggregateSse({ body: source } as UpstreamResult, wireApi)
-    return wireApi === 'responses'
-      ? responsesToChatCompletion(source, model)
-      : chatToResponsesCompletion(source, model)
+    try {
+      if (clientApi === wireApi) return await aggregateSse({ body: source } as UpstreamResult, wireApi)
+      return await (wireApi === 'responses'
+        ? responsesToChatCompletion(source, model)
+        : chatToResponsesCompletion(source, model))
+    } catch (err) {
+      // Converters throw plain Errors; hand the rotation loop a classified
+      // UpstreamError so an in-body failure rotates like any other exit-shaped
+      // failure instead of surfacing as a bare 500.
+      throw ensureUpstreamError(err)
+    }
   }
 
   #responseHeaders(stream: boolean): Record<string, string> {
@@ -485,9 +556,10 @@ async function aggregateSse(result: UpstreamResult, api: UpstreamApi): Promise<R
 
   const events = parseSseData(raw)
   if (api === 'responses') {
-    // A failed response must not masquerade as an empty success: surface the
-    // error object the bridge emitted (or the upstream's own error body) as a
-    // proper OpenAI error envelope.
+    // A failed response must not masquerade as an empty success: THROW the
+    // error the bridge emitted (or the upstream's own error body) so it reaches
+    // the rotation loop and the client gets a real status code, instead of an
+    // HTTP 200 wrapping an error object that SDKs read as a malformed reply.
     const failed = events.find(
       (e): e is Record<string, unknown> =>
         typeof e === 'object' && e !== null && (e as Record<string, unknown>).type === 'response.failed',
@@ -496,19 +568,14 @@ async function aggregateSse(result: UpstreamResult, api: UpstreamApi): Promise<R
       const response = isRecord((failed as { response?: unknown }).response) ? (failed as { response: Record<string, unknown> }).response : {}
       const error = isRecord(response.error) ? response.error : {}
       const message = typeof error.message === 'string' ? error.message : 'upstream response failed'
-      const code = typeof error.code === 'string' ? error.code : 'upstream_error'
-      return blobStream(JSON.stringify({ error: { message, type: 'upstream_error', code } }))
+      throw inBodyFailure(message)
     }
     const bareError = events.find(
       (e): e is Record<string, unknown> =>
         typeof e === 'object' && e !== null && (e as Record<string, unknown>).type === 'error',
     )
     if (bareError && typeof (bareError as { message?: unknown }).message === 'string') {
-      return blobStream(
-        JSON.stringify({
-          error: { message: (bareError as { message: string }).message, type: 'upstream_error', code: (bareError as { code?: string }).code ?? null },
-        }),
-      )
+      throw inBodyFailure((bareError as { message: string }).message)
     }
     // OpenAI returns the *response object* for a non-streaming /v1/responses
     // call, so unwrap response.completed; falling back to the last non-ping
@@ -525,15 +592,14 @@ async function aggregateSse(result: UpstreamResult, api: UpstreamApi): Promise<R
   }
 
   // Chat: an upstream (or gateway-injected) error object inside an HTTP 200 SSE
-  // body is still a failure — never return it as an empty "successful" answer.
+  // body is still a failure — never answer with an empty "successful" reply.
   const chatError = events.find(
     (e): e is Record<string, unknown> => typeof e === 'object' && e !== null && isRecord((e as Record<string, unknown>).error),
   )
   if (chatError && !Array.isArray((chatError as Record<string, unknown>).choices)) {
     const err = (chatError as { error: Record<string, unknown> }).error
     const message = typeof err.message === 'string' ? err.message : 'upstream error'
-    const code = typeof err.code === 'string' ? err.code : null
-    return blobStream(JSON.stringify({ error: { message, type: 'upstream_error', code } }))
+    throw inBodyFailure(message)
   }
 
   let content = ''
@@ -640,6 +706,14 @@ function findSseError(head: string): { message: string; status: number } | null 
     if (parsed.type === 'error' && typeof parsed.message === 'string') {
       return { message: parsed.message, status: 502 }
     }
+    // A Responses-wire stream fails with `response.failed` rather than a bare
+    // error object; without this arm a failure at the head of the stream was
+    // replayed to the client instead of rotating to another exit.
+    if (parsed.type === 'response.failed') {
+      const resp = isRecord(parsed.response) ? parsed.response : {}
+      const err = isRecord(resp.error) ? resp.error : {}
+      return { message: typeof err.message === 'string' ? err.message : 'upstream response failed', status: 502 }
+    }
   }
   return null
 }
@@ -652,3 +726,38 @@ function classifyStreamError(message: string): FailureKind {
   if (/unauthor|forbidden|missing api key|\b40[13]\b/.test(text)) return 'refused'
   return 'server'
 }
+
+/**
+ * Build the error the rotation loop sees when an HTTP 200 body hides a failure.
+ * `status: 502` makes it an upstream error to the client; `kind` decides how the
+ * pool records it — a region verdict bans the exit×model pairing outright, a
+ * rate limit cools the exit, an unknown 5xx soft-bans only after two samples.
+ */
+function inBodyFailure(message: string): UpstreamError {
+  const e = new Error(`upstream error in response body: ${message}`) as UpstreamError
+  e.kind = classifyStreamError(message)
+  e.status = 502
+  return e
+}
+
+/**
+ * Give an error a FailureKind/status when its thrower didn't set one. The
+ * protocol converters throw plain Errors, and a body-budget overrun surfaces as
+ * a stream error, so without this the rotation loop would fall back to
+ * 'transport' regardless of cause. Stalls and budget overruns are genuinely
+ * transport-shaped (cool the exit, let the prober verify); everything else is
+ * judged by its message.
+ */
+function ensureUpstreamError(err: unknown): Error {
+  const existing = err as UpstreamError
+  if (existing && typeof existing.kind === 'string') return existing
+  const message = err instanceof Error ? err.message : String(err)
+  const wrapped = new Error(message) as UpstreamError
+  wrapped.kind = /\bbudget\b|timeout|timed out|aborted|econnreset|socket hang up|socket hang|idle/.test(message.toLowerCase())
+    ? 'transport'
+    : classifyStreamError(message)
+  wrapped.status = 502
+  return wrapped
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
