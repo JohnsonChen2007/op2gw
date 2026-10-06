@@ -455,3 +455,93 @@ test('starved pool fires the on-demand verification kick and refuses with 503', 
   )
   assert.ok(kicks >= 1, 'pool starvation triggers an immediate re-verification round')
 })
+
+test('a non-streaming 200 carrying an error object rotates instead of answering', async () => {
+  // A non-streaming client must never receive HTTP 200 wrapping an error
+  // object: SDKs read that as a malformed reply. The aggregator THROWS, so the
+  // turn re-enters rotation exactly like a real 429.
+  let hits = 0
+  const { url, seen } = await startZen((_seen, res) => {
+    hits += 1
+    if (hits === 1) {
+      return sse(200, 'data: {"error":{"message":"upstream 429 rate limit exceeded, retry later"}}\n\n', res)
+    }
+    return sse(200, chatSse(CHAT_MODEL, 'aggregated after rotate'), res)
+  })
+  const { gateway, pool } = makeGateway(url, { poolEnabled: true, exits: ['http://exit-a:1', 'http://exit-b:1'] })
+  const result = await gateway.handle({
+    api: 'chat',
+    body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+    clientStream: false,
+  })
+  assert.equal(result.status, 200)
+  assert.equal(result.trace.attempts, 2, 'the in-body failure rotated once')
+  const payload = JSON.parse(await collect(result.body)) as { choices: Array<{ message: { content: string } }> }
+  assert.equal(payload.choices[0]?.message.content, 'aggregated after rotate')
+  assert.equal(seen.length, 2)
+  assert.equal(pool.usableCount(CHAT_MODEL), 1, 'the in-body 429 cooled the offending exit')
+})
+
+test('a non-streaming turn that only ever carries in-body errors surfaces a real status', async () => {
+  // The old behaviour answered 200 with the error blob; the client then had to
+  // parse an error out of a "successful" completion.
+  const { url } = await startZen((_seen, res) => sse(200, 'data: {"error":{"message":"upstream 500 internal error"}}\n\n', res))
+  const { gateway } = makeGateway(url, {
+    poolEnabled: true,
+    exits: ['http://exit-a:1', 'http://exit-b:1'],
+    maxRotateAttempts: 2,
+  })
+  await assert.rejects(
+    gateway.handle({
+      api: 'chat',
+      body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      clientStream: false,
+    }),
+    (err: unknown) =>
+      err instanceof GatewayHttpError && err.status === 502 && /error in response body/.test(err.message),
+  )
+})
+
+test('a non-streaming body that never ends is bounded by the total budget', async () => {
+  // The non-streaming path skips the idle watchdog on purpose (a reasoning
+  // model may legitimately go quiet for minutes), so a half-open upstream is
+  // bounded only by this wall-clock budget. Without it the request hangs until
+  // the client or a proxy gives up.
+  const { url } = await startZen((_seen, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.write('{"partial":true')
+    // deliberately never end()
+  })
+  const { gateway } = makeGateway(url, { bodyBudgetMs: 120 })
+  await assert.rejects(
+    gateway.handle({
+      api: 'chat',
+      body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      clientStream: false,
+    }),
+    (err: unknown) => err instanceof GatewayHttpError && err.status === 502 && /budget/.test(err.message),
+  )
+})
+
+test('a client disconnect mid-flight ends as 499 without punishing the exit', async () => {
+  // A disconnect is not an exit failure: rotating would burn the budget on a
+  // request nobody is waiting for, and marking failure would cool a perfectly
+  // healthy tunnel. The gateway must absorb it and report 499.
+  const { url } = await startZen(() => {
+    // never write anything: the request stays pending until the client leaves
+  })
+  const { gateway, pool } = makeGateway(url, { poolEnabled: true, exits: ['http://exit-a:1', 'http://exit-b:1'] })
+  const before = pool.usableCount(CHAT_MODEL)
+  const abort = new AbortController()
+  setTimeout(() => abort.abort(), 50)
+  await assert.rejects(
+    gateway.handle({
+      api: 'chat',
+      body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      clientStream: true,
+      signal: abort.signal,
+    }),
+    (err: unknown) => err instanceof GatewayHttpError && err.status === 499 && err.type === 'client_closed_request',
+  )
+  assert.equal(pool.usableCount(CHAT_MODEL), before, 'the exit is untouched after a client disconnect')
+})

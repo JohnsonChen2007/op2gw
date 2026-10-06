@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { defaultConfig } from '../dist/core/config.js'
-import { Runtime } from '../dist/runtime.js'
+import { Runtime, VERSION } from '../dist/runtime.js'
 
 /**
  * Runtime unit tests — applyManualPool reconciliation (settings-page proxy
@@ -184,3 +184,32 @@ test('Runtime with includeDirect: false excludes direct from pool and routes str
   }
 })
 
+
+test('health reports ok while an exit is usable and degraded once none is', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'op2gw-rt-'))
+  tempDirs.push(dir)
+  const cfg = defaultConfig()
+  cfg.dataDir = dir
+  cfg.logLevel = 'error'
+  cfg.zenBaseUrl = 'http://127.0.0.1:9'
+  cfg.metadataUrl = 'http://127.0.0.1:9'
+  cfg.proxy = ''
+  cfg.pool.enabled = true
+  cfg.pool.includeDirect = false
+  cfg.pool.freeSources = []
+  cfg.pool.manual = ['http://proxy.example:8080']
+  const rt = new Runtime(cfg)
+  try {
+    // A monitor must be able to tell "the process is up" from "the process is
+    // up but every exit is cooling/dead/banned" — the old /healthz always said
+    // 200, which hid exactly the outage self-heal exists to detect.
+    assert.equal(rt.health().status, 'ok')
+    assert.equal(rt.health().pool.usable, 1)
+    rt.pool.markProbe('http://proxy.example:8080', false, 0)
+    assert.equal(rt.health().status, 'degraded')
+    assert.equal(rt.health().pool.usable, 0)
+    assert.equal(rt.health().version, VERSION)
+  } finally {
+    await rt.stop()
+  }
+})
