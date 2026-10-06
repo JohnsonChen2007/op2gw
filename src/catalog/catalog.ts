@@ -207,7 +207,13 @@ export class ModelCatalog {
       await this.refreshOnce()
     }
     if (this.#stopped) return
-    this.#timer = setInterval(() => void this.refreshOnce(), this.#opts.refreshSeconds * 1000)
+    this.#timer = setInterval(() => {
+      // Caught: this is fire-and-forget, and a rejection here would otherwise
+      // surface as an unhandledRejection and kill an otherwise healthy gateway.
+      void this.refreshOnce().catch((err) => {
+        this.#opts.logger.warn('scheduled refresh failed', { error: err instanceof Error ? err.message : String(err) })
+      })
+    }, this.#opts.refreshSeconds * 1000)
     this.#timer.unref?.()
   }
 

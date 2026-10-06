@@ -34,7 +34,32 @@ export interface UpstreamResult {
 export interface UpstreamError extends Error {
   kind: FailureKind
   status?: number
+  /** Milliseconds the upstream asked us to back off (`Retry-After`), if any. */
+  retryAfterMs?: number
 }
+
+/**
+ * Parse a `Retry-After` header into milliseconds. Accepts both forms the spec
+ * allows (delta-seconds and an HTTP-date), returns undefined when absent or
+ * unparseable, and caps the result so a hostile/absurd value cannot park an
+ * exit in cooldown for hours.
+ */
+export function parseRetryAfter(value: string | string[] | undefined, now = Date.now()): number | undefined {
+  if (value === undefined) return undefined
+  const raw = (Array.isArray(value) ? value[0] : value)?.trim()
+  if (!raw) return undefined
+  const seconds = Number(raw)
+  if (Number.isFinite(seconds)) {
+    if (seconds <= 0) return undefined
+    return Math.min(seconds * 1000, RETRY_AFTER_CAP_MS)
+  }
+  const at = Date.parse(raw)
+  if (Number.isNaN(at)) return undefined
+  const delta = at - now
+  return delta > 0 ? Math.min(delta, RETRY_AFTER_CAP_MS) : undefined
+}
+
+const RETRY_AFTER_CAP_MS = 5 * 60_000
 
 export function classifyStatus(status: number, bodyHint = ''): FailureKind {
   if (status === 429) return 'limited'
@@ -78,6 +103,17 @@ export interface ForwardOptions {
    * stream EOF instead.
    */
   noWatchdog?: boolean
+  /**
+   * Hard wall-clock budget for reading a NON-STREAMING response body. This is
+   * the only bound that path has: with `noWatchdog` set and undici's
+   * `bodyTimeout` disabled, a half-open upstream or proxy that never sends FIN
+   * would otherwise hang the request forever. An idle window cannot be used
+   * here — a legitimately slow reasoning model may go quiet for minutes — so we
+   * bound total time instead. Streaming keeps its first-byte/idle watchdogs
+   * (which must stay idle-based or they would truncate long generations) and
+   * ignores this budget. 0 disables it.
+   */
+  bodyTotalMs?: number
 }
 
 export async function forwardUpstream(options: ForwardOptions): Promise<UpstreamResult> {
@@ -127,6 +163,7 @@ export async function forwardUpstream(options: ForwardOptions): Promise<Upstream
     const e = new Error(`upstream HTTP ${res.statusCode}: ${hint.slice(0, 300)}`) as UpstreamError
     e.kind = classifyStatus(res.statusCode, hint)
     e.status = res.statusCode
+    e.retryAfterMs = parseRetryAfter(res.headers['retry-after'])
     throw e
   }
 
@@ -134,9 +171,12 @@ export async function forwardUpstream(options: ForwardOptions): Promise<Upstream
   // Non-streaming aggregators consume the raw body directly (no watchdog), so we
   // must NOT attach a 'data' listener to `source` here — doing so flips it into
   // flowing mode and starves the raw reader. Only build the watchdog stream when
-  // actually streaming.
+  // actually streaming. `wrapDeadline` is safe on this path: it owns the reader
+  // and hands the consumer its own wrapper, so nothing else reads `source`.
   if (options.noWatchdog) {
-    return { status: res.statusCode, headers: outHeaders, body: source, rawBody: source, contentType }
+    const budget = options.bodyTotalMs ?? 0
+    const bounded = budget > 0 ? wrapDeadline(source, budget) : source
+    return { status: res.statusCode, headers: outHeaders, body: bounded, rawBody: bounded, contentType }
   }
   const body = wrapWatchdog(source, options.firstByteMs ?? 30_000, options.bodyIdleMs ?? 120_000)
   return { status: res.statusCode, headers: outHeaders, body, rawBody: source, contentType }
@@ -178,6 +218,59 @@ export function wrapWatchdog(source: Readable, firstByteMs: number, bodyIdleMs: 
   source.on('error', (err) => {
     if (timer) clearTimeout(timer)
     out.destroy(err)
+  })
+  // Consumer gone (client disconnect, pipeline error): release the upstream
+  // instead of draining a whole generation into a stream nobody reads.
+  out.on('close', () => {
+    if (timer) clearTimeout(timer)
+    if (!source.readableEnded && !source.destroyed) source.destroy()
+  })
+  return out
+}
+
+/**
+ * Wrap a readable so it errors once `budgetMs` of wall-clock time has elapsed,
+ * regardless of how much data has flowed. Unlike `wrapWatchdog` this never
+ * rearms, so it bounds TOTAL time rather than silence — which is exactly what a
+ * non-streaming body read needs (that path deliberately tolerates long quiet
+ * stretches, so an idle window cannot protect it).
+ *
+ * A 0 budget returns the source untouched. The wrapper also destroys the source
+ * when its own consumer drops it, so an abandoned read does not keep an upstream
+ * connection pinned open.
+ */
+export function wrapDeadline(source: Readable, budgetMs: number): Readable {
+  if (budgetMs <= 0) return source
+  const out = new Readable({ read() {} })
+  let settled = false
+  const timer = setTimeout(() => {
+    if (settled) return
+    settled = true
+    const err = new Error(`op2gw: upstream body exceeded its ${budgetMs}ms budget`)
+    source.destroy(err)
+    out.destroy(err)
+  }, budgetMs)
+  timer.unref?.()
+  const settle = (): void => {
+    if (settled) return
+    settled = true
+    clearTimeout(timer)
+  }
+  source.on('data', (chunk) => {
+    if (!out.push(chunk)) source.pause()
+  })
+  out.on('drain', () => source.resume())
+  source.on('end', () => {
+    settle()
+    out.push(null)
+  })
+  source.on('error', (err) => {
+    settle()
+    out.destroy(err)
+  })
+  out.on('close', () => {
+    settle()
+    if (!source.readableEnded && !source.destroyed) source.destroy()
   })
   return out
 }

@@ -38,6 +38,9 @@ export interface RuntimeStatus {
 
 const VERSION = '0.2.1'
 
+/** Floor between two recovery-triggered free-source fetches. */
+const RECOVER_REFRESH_MIN_INTERVAL_MS = 60_000
+
 export class Runtime {
   readonly config: Op2gwConfig
   readonly logger: Logger
@@ -50,6 +53,8 @@ export class Runtime {
   readonly #selfHealer: SelfHealer
   #freeTimer: NodeJS.Timeout | null = null
   #startedAt = 0
+  /** Throttles the free-source fetch fired by an on-demand recovery. */
+  #lastRecoverRefresh = 0
 
   constructor(config: Op2gwConfig) {
     this.config = config
@@ -131,11 +136,12 @@ export class Runtime {
       maxRotateAttempts: config.pool.maxRotateAttempts,
       poolEnabled: config.pool.enabled,
       directAllowed: config.pool.includeDirect,
+      // Non-streaming bodies have no idle watchdog, so this budget is the only
+      // thing keeping a half-open upstream from hanging a request forever.
+      bodyBudgetMs: config.bodyBudgetMs,
       // Refusing a request is also a recovery signal: verify every exit right
       // now (multi-site) instead of waiting for the scheduled probe rounds.
-      onPoolStarved: () => {
-        if (this.#prober) void this.#prober.tick(true)
-      },
+      onPoolStarved: () => this.#recoverPool(),
     })
 
     this.#selfHealer = new SelfHealer({
@@ -143,6 +149,56 @@ export class Runtime {
       catalog: this.catalog,
       pool: this.pool,
       config,
+      // An idle gateway must recover on its own too. Previously the only thing
+      // that re-verified a starved pool was an incoming client request, so a
+      // pool that died overnight stayed dead until somebody showed up.
+      onPoolStarved: () => this.#recoverPool(),
+    })
+  }
+
+  /**
+   * Bring a starved pool back without waiting for the schedule: force-verify
+   * every exit (a tunnel that quietly recovered is revived now rather than
+   * after the next probe round) and top the pool up from the free sources.
+   *
+   * Shared by the gateway's on-demand kick and the self-heal watchdog so an
+   * idle gateway heals too. Both promises are explicitly caught — they are
+   * fire-and-forget, and one escaped rejection would become an
+   * unhandledRejection. The source fetch is rate-limited because under a
+   * sustained outage it would otherwise be hit by every single request.
+   */
+  #recoverPool(): void {
+    if (this.#prober) {
+      void this.#prober.tick(true).catch((err) => {
+        this.logger.child('prober').warn('on-demand probe round failed', {
+          error: err instanceof Error ? err.message : String(err),
+        })
+      })
+    }
+    const now = Date.now()
+    if (now - this.#lastRecoverRefresh < RECOVER_REFRESH_MIN_INTERVAL_MS) return
+    this.#lastRecoverRefresh = now
+    void this.refreshFreePool().catch((err) => {
+      this.logger.child('pool').warn('on-demand pool refresh failed', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    })
+  }
+
+  /**
+   * Run a full verification round right now, bypassing the probe schedule.
+   *
+   * Exposed for the admin "probe" endpoint: that route previously called the
+   * free-source refresher instead, so the debug UI's probe button never
+   * actually probed anything and an operator had no manual way to revive a
+   * dead pool.
+   */
+  forceProbe(): void {
+    if (!this.#prober) return
+    void this.#prober.tick(true).catch((err) => {
+      this.logger.child('prober').warn('forced probe round failed', {
+        error: err instanceof Error ? err.message : String(err),
+      })
     })
   }
 
@@ -271,8 +327,14 @@ export class Runtime {
   async start(): Promise<void> {
     this.#startedAt = Date.now()
     this.logger.child('runtime').info('starting', { version: VERSION, poolEnabled: this.config.pool.enabled })
-    // Catalog first (non-blocking retries inside).
-    void this.catalog.start()
+    // Catalog first (non-blocking retries inside). Caught explicitly: this is
+    // fire-and-forget, and a rejection escaping it would otherwise take the
+    // process down before it ever served a request.
+    void this.catalog.start().catch((err) => {
+      this.logger.child('catalog').warn('catalog bootstrap failed', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    })
     if (this.config.pool.enabled) {
       await this.refreshFreePool()
       this.#prober?.start(this.config.pool.probeIntervalMs)
@@ -310,10 +372,40 @@ export class Runtime {
       if (added > 0) {
         this.logger.child('pool').info('admitted free candidates', { added, total: this.pool.size() })
         // Kick a probe round so new nodes get an admission verdict promptly.
-        void this.#prober?.tick()
+        void this.#prober?.tick().catch((err) => {
+          this.logger.child('prober').warn('admission probe round failed', {
+            error: err instanceof Error ? err.message : String(err),
+          })
+        })
       }
     } catch (err) {
       this.logger.child('pool').warn('free pool refresh failed', { error: err instanceof Error ? err.message : String(err) })
+    }
+  }
+
+  /**
+   * Liveness/readiness snapshot for `/healthz` and external monitoring.
+   *
+   * `degraded` means the gateway cannot serve a single request right now: every
+   * exit is cooling/dead/banned (or direct egress is disallowed with no proxy
+   * left). The old endpoint always answered 200, so a monitor could only tell
+   * "the process is up" — never "the process is up but serving nothing", which
+   * is precisely the outage self-heal exists to detect.
+   */
+  health(): {
+    status: 'ok' | 'degraded'
+    version: string
+    uptimeMs: number
+    catalog: CatalogSnapshot
+    pool: { enabled: boolean; total: number; usable: number }
+  } {
+    const usable = this.pool.usableCount('*')
+    return {
+      status: usable === 0 ? 'degraded' : 'ok',
+      version: VERSION,
+      uptimeMs: this.#startedAt === 0 ? 0 : Date.now() - this.#startedAt,
+      catalog: this.catalog.snapshot(),
+      pool: { enabled: this.config.pool.enabled, total: this.pool.size(), usable },
     }
   }
 
