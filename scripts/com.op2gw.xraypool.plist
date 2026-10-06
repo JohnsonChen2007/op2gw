@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.op2gw.xraypool</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/johnson/Library/Application Support/v2rayN/bin/xray/xray</string>
+        <string>run</string>
+        <string>-c</string>
+        <string>/Users/johnson/.op2gw/xray-pool/config.json</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key><string>/Users/johnson/.op2gw/xray-pool/xray.log</string>
+    <key>StandardErrorPath</key><string>/Users/johnson/.op2gw/xray-pool/xray.log</string>
+</dict>
+</plist>
