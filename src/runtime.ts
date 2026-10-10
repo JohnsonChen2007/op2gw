@@ -203,24 +203,40 @@ export class Runtime {
   }
 
   /**
-   * A fetch bound to egress through the IP pool (or configured default proxy) —
-   * used by the model catalog and the free-source fetcher so their traffic follows
-   * the proxy pool and never leaks the host's direct IP when direct egress is disallowed.
+   * A fetch for the gateway's OWN outbound HTTP calls (model catalog S1/S2,
+   * free proxy-source lists) — never the inference path.
+   *
+   * These calls need egress control (never leak the host's direct IP when
+   * direct egress is disallowed) but NOT the pool's per-IP rotation. The free
+   * lane meters inference quota per egress IP, so rotating exits matters for
+   * INFERENCE; a catalog fetch is one cheap GET every few minutes and gains
+   * nothing from churning IPs.
+   *
+   * Routing them through the pool first was a footgun: the pool deliberately
+   * rotates across exits — including ones that just flapped to 'dead' — so on a
+   * bad round the catalog's S1 fetch landed on a dead SOCKS port and timed out
+   * ("fetch failed"), leaving the catalog stuck at 'pending' with an EMPTY model
+   * list. That then failed every inference request's free-model check
+   * (metadata_pending) — a dependency that gates the whole gateway was riding
+   * the churning exit pool. Order is therefore: STABLE default proxy (itself a
+   * proxy, so no direct-IP leak) -> a non-direct pool exit -> direct (or refuse).
    */
   #proxyFetch(): typeof fetch {
     return (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       let exit: ExitNode | null = null
       let dispatcher: Dispatcher | undefined
 
-      if (this.config.pool.enabled) {
+      // 1. Stable default proxy first, when configured (the healthy default).
+      if (this.dispatchers.defaultProxy) {
+        dispatcher = this.dispatchers.directDispatcher()
+      }
+      // 2. Fall back to a non-direct pool exit (no default proxy configured).
+      if (!dispatcher && this.config.pool.enabled) {
         const pick = this.pool.pick('*', 'catalog')
         if (pick && pick.exit.kind !== 'direct') {
           exit = pick.exit
           dispatcher = this.dispatchers.forExit(pick.exit)
         }
-      }
-      if (!dispatcher && this.dispatchers.defaultProxy) {
-        dispatcher = this.dispatchers.directDispatcher()
       }
       if (!dispatcher) {
         if (!this.config.pool.includeDirect) {
