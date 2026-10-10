@@ -4,25 +4,11 @@
 const $ = (sel) => document.querySelector(sel)
 const $$ = (sel) => Array.from(document.querySelectorAll(sel))
 
-// Bearer key used for both admin + v1 when the gateway requires auth. The UI
-// reads it from localStorage so a keyed deployment still works from the panel.
-function authHeaders() {
-  const key = localStorage.getItem('op2gw_key') || ''
-  return key ? { authorization: 'Bearer ' + key } : {}
-}
-
 async function api(path, options = {}) {
   const res = await fetch(path, {
     ...options,
-    headers: { 'content-type': 'application/json', ...authHeaders(), ...(options.headers || {}) },
+    headers: { 'content-type': 'application/json', ...(options.headers || {}) },
   })
-  if (res.status === 401) {
-    const key = prompt('网关需要密钥，请输入 API key：')
-    if (key) {
-      localStorage.setItem('op2gw_key', key)
-      return api(path, options)
-    }
-  }
   return res
 }
 
@@ -85,7 +71,7 @@ async function loadStatus() {
     $('#ovError').textContent = JSON.stringify(s.catalog, null, 2)
 
     $('#baseUrlBox').textContent =
-      'base_url = ' + location.origin + '/v1\n' + 'api_key  = (留空，或配置的网关密钥)'
+      'base_url = ' + location.origin + '/v1\n' + 'api_key  = (留空或任意值；本机不校验)'
 
     renderExits(s.pool.exits || [])
     renderSources(s.pool.sources || [])
@@ -180,8 +166,7 @@ async function loadTraces() {
 let logStream = null
 function startLogStream() {
   if (logStream) logStream.close()
-  const key = localStorage.getItem('op2gw_key') || ''
-  const url = '/admin/logs/stream' + (key ? '?key=' + encodeURIComponent(key) : '')
+  const url = '/admin/logs/stream'
   logStream = new EventSource(url)
   logStream.onmessage = (ev) => {
     try {
@@ -424,8 +409,6 @@ async function loadSettings() {
   $('#setProxy').value = s.proxy || ''
   $('#setLogLevel').value = s.logLevel || 'info'
   $('#setPoolHint').textContent = s.poolEnabled ? '已启用（出口轮换）' : '未启用（直连 / 单一代理）'
-  $('#setApiKeys').value = ''
-  $('#setApiKeys').placeholder = s.hasApiKeys ? '已设置（留空则不改动）' : 'key1,key2（留空为开放）'
   $('#envProxyHint').textContent = s.envProxyDetected
     ? '系统检测到代理：' + s.envProxyDetected
     : '未在环境变量中检测到代理'
@@ -560,8 +543,6 @@ $('#btnSaveSettings').addEventListener('click', async () => {
     proxy: $('#setProxy').value.trim(),
     logLevel: $('#setLogLevel').value,
   }
-  const keys = $('#setApiKeys').value.trim()
-  if (keys) payload.apiKeys = keys.split(',').map((k) => k.trim()).filter(Boolean)
   const res = await api('/admin/settings', { method: 'PUT', body: JSON.stringify(payload) })
   const data = await res.json()
   if (data.ok) {

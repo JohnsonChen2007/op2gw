@@ -18,12 +18,6 @@ export interface Op2gwConfig {
   host: string
   /** HTTP listen port. Default 8787. */
   port: number
-  /**
-   * Gateway API keys clients must present as `Authorization: Bearer <key>`.
-   * Empty array = open (loopback dev). Generated + persisted on first run when
-   * left unset and host is non-loopback.
-   */
-  apiKeys: string[]
   /** Upstream base, default https://opencode.ai/zen . */
   zenBaseUrl: string
   /** models.dev metadata endpoint. */
@@ -97,7 +91,6 @@ export function defaultConfig(): Op2gwConfig {
   return {
     host: '127.0.0.1',
     port: 8787,
-    apiKeys: [],
     zenBaseUrl: 'https://opencode.ai/zen',
     metadataUrl: 'https://models.dev/api.json',
     refreshSeconds: 300,
@@ -198,8 +191,6 @@ export async function loadConfig(argv: string[] = process.argv.slice(2)): Promis
   } else {
     cfg.proxy = normalizeProxyUri(cfg.proxy)
   }
-  const apiKeys = splitList(env.OP2GW_API_KEYS)
-  if (apiKeys) cfg.apiKeys = apiKeys
   cfg.pool.enabled = coerceBool(env.OP2GW_POOL_ENABLED, cfg.pool.enabled)
   const manual = splitList(env.OP2GW_POOL_MANUAL)
   if (manual) cfg.pool.manual = manual
@@ -238,7 +229,6 @@ export async function saveConfig(cfg: Op2gwConfig): Promise<string> {
   const persisted = {
     host: cfg.host,
     port: cfg.port,
-    apiKeys: cfg.apiKeys,
     zenBaseUrl: cfg.zenBaseUrl,
     refreshSeconds: cfg.refreshSeconds,
     bodyBudgetMs: cfg.bodyBudgetMs,
@@ -274,6 +264,7 @@ export function detectEnvProxy(): string {
 function mergeConfig(target: Op2gwConfig, patch: Partial<Op2gwConfig>): void {
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined || value === null) continue
+    if (key === 'apiKeys') continue
     if (key === 'pool' && typeof value === 'object') {
       Object.assign(target.pool, value)
     } else if (key === 'selfHeal' && typeof value === 'object') {

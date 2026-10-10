@@ -215,11 +215,6 @@ export async function handleAdmin(
       runtime.config.refreshSeconds = Math.floor(body.refreshSeconds)
       applied.refreshSeconds = runtime.config.refreshSeconds
     }
-    // API keys — live-applied (server reads runtime.config on each request).
-    if (Array.isArray(body.apiKeys)) {
-      runtime.config.apiKeys = body.apiKeys.map((k) => String(k)).filter((k) => k.length > 0)
-      applied.apiKeys = runtime.config.apiKeys.length
-    }
     // Port — persisted only; requires restart.
     if (typeof body.port === 'number' && body.port >= 1 && body.port <= 65535) {
       const port = Math.floor(body.port)
