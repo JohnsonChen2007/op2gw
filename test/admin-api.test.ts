@@ -77,7 +77,6 @@ async function makeFakeRuntime(pool: string[] = []): Promise<FakeRuntime> {
       logLevel: 'error',
       refreshSeconds: config.refreshSeconds,
       poolEnabled: config.pool.enabled,
-      hasApiKeys: config.apiKeys.length > 0,
       envProxyDetected: '',
       configPath: join(dir, 'config.json'),
       proxyPool: [...config.pool.manual],

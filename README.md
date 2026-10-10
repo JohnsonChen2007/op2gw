@@ -221,12 +221,12 @@ OpenCode Zen 免费层（经实测）有**两道校验，缺一即被 403 拒绝
 
 ## 配置
 
-零配置即可在 loopback 直连运行。可用 `~/.op2gw/config.json`、`--config <path>`、环境变量或命令行覆盖。
+零配置即可在 loopback 直连运行；可用 `~/.op2gw/config.json`、`--config <path>`、环境变量或命令行覆盖。op2gw 已删除本机客户端 API key 认证：`Authorization`、`x-api-key` 可省略、为空或填写任意值，均不会被网关校验。默认监听仍为 `127.0.0.1`，因此默认只接受本机访问；若显式把 `host`/`OP2GW_HOST` 设为 `0.0.0.0` 或其他非 loopback 地址，网关和 `/admin` 将在该网络范围内完全开放，请只在可信网络使用。上游请求仍固定使用匿名凭证 `Authorization: Bearer public`，不会转发客户端填写的值。
+
 
 | 字段 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `host` / `port` | `OP2GW_HOST` / `OP2GW_PORT` | `127.0.0.1` / `8787` | 亦可 `--host` / `--port` |
-| `apiKeys` | `OP2GW_API_KEYS` | `[]`（loopback 开放） | 逗号分隔的网关 bearer key |
 | `zenBaseUrl` | `OP2GW_ZEN_URL` | `https://opencode.ai/zen` | 上游地址 |
 | `refreshSeconds` | `OP2GW_REFRESH_SECONDS` | `300` | 实时目录刷新间隔 |
 | `logLevel` | `OP2GW_LOG_LEVEL` | `info` | debug/info/warn/error |
@@ -301,7 +301,7 @@ for chunk in resp:
 | `POST /v1/messages` | **Anthropic Messages —— Claude Code 直接接入**（新增，纯附加） |
 | `GET /admin/status` · `/admin/models` · `/admin/logs` · `/admin/logs/stream` · `/admin/traces` | 调试后端 |
 | `POST /admin/pool/exits` · `/admin/pool/pin` · `/admin/pool/refresh` · `/admin/catalog/refresh` | 调试控制 |
-| `GET /admin/settings` · `PUT /admin/settings` | 读取 / 更新配置（端口、代理、日志级别、密钥；代理与日志即时生效，端口保存后重启生效） |
+| `GET /admin/settings` · `PUT /admin/settings` | 读取 / 更新配置（端口、代理、日志级别；代理与日志即时生效，端口保存后重启生效） |
 | `GET /` | 调试控制台网页（含仿 omniroute 的设置页） |
 
 ---

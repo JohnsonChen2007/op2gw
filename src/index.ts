@@ -30,10 +30,10 @@ import { clientStreamErrorBody, withInBandError, type ClientDialect } from './ga
  *   /admin/*                         debug backend (see admin/api.ts)
  *   /*                               static debug UI from public/
  *
- * Any OpenAI-compatible tool points its baseURL at http://host:port/v1 and
- * uses any configured gateway key (or none, on loopback). The gateway disguises
- * the request as the OpenCode CLI and forwards it to the Zen anonymous lane
- * over the rotating exit pool.
+ * Any OpenAI-compatible tool points its baseURL at http://host:port/v1.
+ * Client authentication is intentionally not used; the gateway disguises the
+ * request as the OpenCode CLI and forwards it to the Zen anonymous lane over
+ * the rotating exit pool.
  */
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -55,9 +55,6 @@ async function main(): Promise<void> {
   await runtime.start()
   const log = runtime.logger.child('http')
 
-  const keySet = new Set(config.apiKeys)
-  const authRequired = keySet.size > 0
-
   const server = createServer((req, res) => {
     void handleRequest(req, res).catch((err) => {
       log.error('unhandled request error', { error: err instanceof Error ? err.message : String(err) })
@@ -72,7 +69,7 @@ async function main(): Promise<void> {
 
     // CORS for the debug UI / cross-origin tools.
     res.setHeader('access-control-allow-origin', '*')
-    res.setHeader('access-control-allow-headers', 'authorization, content-type')
+    res.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key')
     res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS')
     if (req.method === 'OPTIONS') {
       res.writeHead(204)
@@ -90,20 +87,14 @@ async function main(): Promise<void> {
       return
     }
 
-    // Admin backend (debug UI). Not gated by the OpenAI key — it's loopback
-    // tooling; gate behind the same key only when keys are configured.
+    // Admin backend (debug UI).
     if (path.startsWith('/admin')) {
-      if (authRequired && !checkAuth(req, keySet)) {
-        json(res, 401, { error: 'unauthorized' })
-        return
-      }
       await handleAdmin(runtime, req, res, url)
       return
     }
 
     // OpenAI v1 surface.
     if (path === '/v1/models' && req.method === 'GET') {
-      if (authRequired && !checkAuth(req, keySet)) return unauthorized(res)
       const created = Math.floor(Date.now() / 1000)
       const data = runtime.gateway.listModelsWithLimits().map((m) => ({
         id: m.id,
@@ -118,7 +109,6 @@ async function main(): Promise<void> {
     }
 
     if ((path === '/v1/chat/completions' || path === '/v1/responses') && req.method === 'POST') {
-      if (authRequired && !checkAuth(req, keySet)) return unauthorized(res)
       await handleInference(req, res, path === '/v1/responses' ? 'responses' : 'chat')
       return
     }
@@ -127,7 +117,6 @@ async function main(): Promise<void> {
     // translated to the OpenAI chat dialect and handed to the SAME gateway
     // pipeline as /v1/chat/completions, then the response is translated back.
     if (path === '/v1/messages' && req.method === 'POST') {
-      if (authRequired && !checkAuth(req, keySet)) return unauthorizedAnthropic(res)
       await handleAnthropicMessages(req, res)
       return
     }
@@ -290,14 +279,14 @@ async function main(): Promise<void> {
 
   server.listen(config.port, config.host, () => {
     const base = `http://${config.host}:${config.port}`
-    log.info('op2gw listening', { url: base, poolEnabled: config.pool.enabled, authRequired })
+    log.info('op2gw listening', { url: base, poolEnabled: config.pool.enabled })
     process.stdout.write(
       `\nop2gw ${VERSION} ready\n` +
         `  OpenAI base URL : ${base}/v1\n` +
         `  Debug UI        : ${base}/\n` +
         `  Health          : ${base}/healthz\n` +
         `  Pool            : ${config.pool.enabled ? 'enabled' : 'disabled (direct)'}\n` +
-        `  Auth            : ${authRequired ? 'required (bearer key)' : 'open (loopback)'}\n\n`,
+        `  Auth            : open (no client authentication)\n\n`,
     )
   })
 
@@ -309,16 +298,6 @@ async function main(): Promise<void> {
   }
   process.on('SIGINT', () => void shutdown())
   process.on('SIGTERM', () => void shutdown())
-}
-
-function checkAuth(req: IncomingMessage, keys: Set<string>): boolean {
-  const header = req.headers['authorization']
-  if (typeof header !== 'string') {
-    const apiKey = req.headers['x-api-key']
-    return typeof apiKey === 'string' && keys.has(apiKey)
-  }
-  const match = /^Bearer\s+(.+)$/i.exec(header)
-  return match ? keys.has(match[1]!.trim()) : false
 }
 
 /**
@@ -356,15 +335,6 @@ function endWithStreamFailure(res: ServerResponse, dialect: ClientDialect, messa
   } catch {
     // already closed
   }
-}
-
-function unauthorized(res: ServerResponse): void {
-  json(res, 401, { error: { message: 'missing or invalid API key', type: 'invalid_request_error' } })
-}
-
-function unauthorizedAnthropic(res: ServerResponse): void {
-  res.writeHead(401, { 'content-type': 'application/json; charset=utf-8', 'www-authenticate': 'Bearer' })
-  res.end(toAnthropicErrorBody('missing or invalid API key', 'authentication_error'))
 }
 
 /**

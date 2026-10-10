@@ -433,7 +433,6 @@ export class Runtime {
     logLevel: string
     refreshSeconds: number
     poolEnabled: boolean
-    hasApiKeys: boolean
     envProxyDetected: string
     configPath: string
     /** Persisted manual proxy pool (auth-aware URIs, verbatim config order). */
@@ -450,7 +449,6 @@ export class Runtime {
       logLevel: this.logger.level,
       refreshSeconds: this.config.refreshSeconds,
       poolEnabled: this.config.pool.enabled,
-      hasApiKeys: this.config.apiKeys.length > 0,
       envProxyDetected: detectEnvProxy(),
       configPath: configFilePath(this.config),
       proxyPool: [...this.config.pool.manual],

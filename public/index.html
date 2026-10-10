@@ -46,7 +46,7 @@
       <h3>接入方式</h3>
       <p class="muted">任何 OpenAI 兼容工具（opencode / curl / SDK）把 base URL 指向下面地址即可，模型走 OpenCode Zen 免费匿名通道。</p>
       <pre id="baseUrlBox">base_url = http://127.0.0.1:8787/v1
-api_key  = (留空，或配置的网关密钥)</pre>
+api_key  = (留空或任意值；本机不校验)</pre>
       <div class="row">
         <button class="btn" id="btnRefreshCatalog">强制刷新目录</button>
         <button class="btn" id="btnRefreshPool">刷新 IP 池</button>
@@ -248,17 +248,6 @@ api_key  = (留空，或配置的网关密钥)</pre>
             </select>
           </div>
           <div class="field"><label>IP 池</label><span class="muted small" id="setPoolHint">—</span></div>
-        </div>
-      </div>
-
-      <!-- Security -->
-      <div class="set-card">
-        <div class="set-head"><span class="set-icon">🔑</span><div><h3>访问密钥</h3><p class="muted small">留空 = loopback 开放。设置后客户端需带 <code>Authorization: Bearer &lt;key&gt;</code>。多个用逗号分隔。</p></div></div>
-        <div class="set-body">
-          <div class="field wide">
-            <label>网关 API Key</label>
-            <input type="text" id="setApiKeys" placeholder="key1,key2（留空为开放）">
-          </div>
         </div>
       </div>
 

@@ -91,6 +91,30 @@ test('saveConfig/loadConfig round-trips the proxy pool and pinned exit', async (
   assert.equal(loaded.pool.enabled, true)
 })
 
+test('loadConfig ignores legacy API keys and saveConfig does not persist them', async () => {
+  const dir = await tempDir()
+  const path = join(dir, 'legacy.json')
+  await (await import('node:fs/promises')).writeFile(
+    path,
+    JSON.stringify({ host: '127.0.0.1', port: 9876, apiKeys: ['legacy-key'] }),
+    'utf8',
+  )
+  const savedEnv = process.env.OP2GW_API_KEYS
+  try {
+    process.env.OP2GW_CONFIG = path
+    process.env.OP2GW_API_KEYS = 'environment-key'
+    const loaded = await loadConfig([])
+    assert.equal(loaded.port, 9876)
+    assert.equal('apiKeys' in loaded, false)
+    await saveConfig(loaded)
+    const onDisk = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+    assert.equal('apiKeys' in onDisk, false)
+  } finally {
+    if (savedEnv === undefined) delete process.env.OP2GW_API_KEYS
+    else process.env.OP2GW_API_KEYS = savedEnv
+  }
+})
+
 test('loadConfig accepts bare host:port via normalizeProxyUri', async () => {
   const dir = await tempDir()
   process.env.OP2GW_CONFIG = join(dir, 'config.json')
