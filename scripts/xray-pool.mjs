@@ -142,7 +142,10 @@ function backendKey(row) {
 
 function selectNodes(db, guiCfg, count, onlyAddresses, excludeAddresses) {
   const exclude = new Set((excludeAddresses ?? '').split(',').map((s) => s.trim()).filter(Boolean))
-  const rows = sqliteJson(db, `SELECT ConfigType AS configType, Remarks AS remarks, Address AS address, Port AS port, Id AS id, Security AS security, Network AS network, HeaderType AS headerType, RequestHost AS requestHost, Path AS path, StreamSecurity AS streamSecurity, Sni AS sni, Flow AS flow, Fingerprint AS fingerprint, PublicKey AS publicKey, ShortId AS shortId, SpiderX AS spiderX, Alpn AS alpn, AllowInsecure AS allowInsecure, Subid AS subid FROM ProfileItem WHERE ConfigType IN (1,5)`)
+  // Some v2rayN builds store the vmess/vless user UUID in `Id`, others in
+  // `Password` (newer schema leaves `Id` empty). Read whichever is populated so
+  // the pool works across v2rayN versions instead of silently finding no nodes.
+  const rows = sqliteJson(db, `SELECT ConfigType AS configType, Remarks AS remarks, Address AS address, Port AS port, COALESCE(NULLIF(Id, ''), NULLIF(Password, '')) AS id, Security AS security, Network AS network, HeaderType AS headerType, RequestHost AS requestHost, Path AS path, StreamSecurity AS streamSecurity, Sni AS sni, Flow AS flow, Fingerprint AS fingerprint, PublicKey AS publicKey, ShortId AS shortId, SpiderX AS spiderX, Alpn AS alpn, AllowInsecure AS allowInsecure, Subid AS subid FROM ProfileItem WHERE ConfigType IN (1,5)`)
     .filter((r) => r.address && r.port && r.id && !exclude.has(r.address))
 
   let activeAddress = ''
