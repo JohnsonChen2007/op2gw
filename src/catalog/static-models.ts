@@ -27,8 +27,9 @@
 /** Models permanently broken/dead upstream (excluded from catalog & requests). */
 export const disabledModels: string[] = [
   'deepseek-v4-flash-free',   // Upstream: "Model is unavailable"
-  'jev-1.13-free',            // Upstream: 500 "Internal server error"
+  'jev-1.13-free',            // Upstream: 403 "free tier can only be used from within OpenCode"
   'ling-3.0-flash-fin-free',  // Upstream: "Endpoint is unavailable"
+  'exo-free',                 // Upstream: 410 "Model exo-free has been deprecated" (verified 3/3, 2026-10)
 ]
 
 /** Zero-cost ids absent from models.dev, verified against the live lane. */
@@ -37,12 +38,13 @@ export const fallbackFreeModels: string[] = []
 /** Verified working subset used to bootstrap the list before S1 lands. */
 export const verifiedFreeModels: string[] = [
   'big-pickle',
+  'ling-3.1-flash-free',
   'longcat-2.5-preview-free',
-  'mimo-v2.5-free',
   'mimo-v2.6-flash-free',
   'muse-spark-1.2-contributor-free',
   'muse-spark-1.3-contributor-free',
   'nemotron-3-ultra-free',
   'nemotron-3.5-lightning-free',
   'space-bunny-free',
+  'step-5-preview-free',
 ]

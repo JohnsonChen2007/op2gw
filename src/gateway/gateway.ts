@@ -106,6 +106,24 @@ export class Gateway {
     return this.#d.catalog.list()
   }
 
+  /**
+   * Resolve the exposed model list with metadata limits for GET /v1/models.
+   *
+   * Context/output limits come from the same catalog that serves inference, so
+   * a client sees the window it will actually be billed and truncated against
+   * instead of a bare id. Undefined when metadata has no row for the id.
+   */
+  listModelsWithLimits(): Array<{ id: string; contextWindow?: number; maxOutput?: number }> {
+    return this.#d.catalog.list().map((id) => {
+      const limits = this.#d.catalog.limits(id)
+      return {
+        id,
+        ...(limits?.contextWindow !== undefined ? { contextWindow: limits.contextWindow } : {}),
+        ...(limits?.maxOutput !== undefined ? { maxOutput: limits.maxOutput } : {}),
+      }
+    })
+  }
+
   isFree(model: string): boolean {
     return this.#d.catalog.decision(model).allowed
   }
