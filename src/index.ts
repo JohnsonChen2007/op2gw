@@ -105,7 +105,14 @@ async function main(): Promise<void> {
     if (path === '/v1/models' && req.method === 'GET') {
       if (authRequired && !checkAuth(req, keySet)) return unauthorized(res)
       const created = Math.floor(Date.now() / 1000)
-      const data = runtime.gateway.listModels().map((id) => ({ id, object: 'model', created, owned_by: 'opencode-zen' }))
+      const data = runtime.gateway.listModelsWithLimits().map((m) => ({
+        id: m.id,
+        object: 'model' as const,
+        created,
+        owned_by: 'opencode-zen',
+        ...(m.contextWindow !== undefined ? { context_length: m.contextWindow } : {}),
+        ...(m.maxOutput !== undefined ? { max_output_tokens: m.maxOutput } : {}),
+      }))
       json(res, 200, { object: 'list', data })
       return
     }

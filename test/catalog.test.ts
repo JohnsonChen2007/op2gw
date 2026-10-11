@@ -161,3 +161,43 @@ test('list() falls back to the verified bootstrap list before S1 lands', () => {
   })
   assert.deepEqual(catalog.list(), [...verifiedFreeModels], 'cold start advertises the verified subset')
 })
+
+/**
+ * The catalog already parses `limit.context`/`limit.output` for every model it
+ * serves; `/v1/models` must surface them instead of a bare id, so a client can
+ * size its own prompt against the window it will actually be truncated and
+ * billed against. Regression guard for exposing metadata limits to clients.
+ */
+test('limits() reports the context window parsed from models.dev metadata', async () => {
+  const zenIds = ['free-with-limits', 'free-without-limits']
+  const modelsDev = {
+    opencode: {
+      models: {
+        'free-with-limits': { cost: { input: 0, output: 0 }, limit: { context: 262144, output: 32768 } },
+        'free-without-limits': { cost: { input: 0, output: 0 } },
+      },
+    },
+  }
+  const fetchImpl = (async (input: unknown) => {
+    const url = String(input)
+    if (url.includes('/v1/models')) {
+      return new Response(JSON.stringify({ object: 'list', data: zenIds.map((id) => ({ id })) }), { status: 200 })
+    }
+    return new Response(JSON.stringify(modelsDev), { status: 200 })
+  }) as unknown as typeof fetch
+
+  const catalog = new ModelCatalog({
+    zenBaseUrl: 'https://zen.example',
+    metadataUrl: 'https://metadata.example/api.json',
+    refreshSeconds: 300,
+    cachePath: '/tmp/op2gw-test-cache-limits.json',
+    logger: silentLogger(),
+    fetchImpl,
+  })
+  await catalog.refreshOnce()
+
+  const withLimits = catalog.limits('free-with-limits')
+  assert.equal(withLimits?.contextWindow, 262144, 'context window is exposed')
+  assert.equal(withLimits?.maxOutput, 32768, 'max output is exposed')
+  assert.equal(catalog.limits('free-without-limits'), undefined, 'no metadata limits yields undefined')
+})

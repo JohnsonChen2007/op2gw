@@ -35,6 +35,10 @@ export interface OpenAIModel {
   object: 'model'
   created: number
   owned_by: string
+  /** Catalog context window in tokens; absent when metadata has no row. */
+  context_length?: number
+  /** Catalog max output tokens; absent when metadata has no row. */
+  max_output_tokens?: number
 }
 
 /** Free-model verdict from the catalog. */
