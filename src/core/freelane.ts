@@ -1,12 +1,19 @@
 /**
  * Free-lane agent-shape gate.
  *
- * The OpenCode Zen anonymous free lane (live-probed by opencode2dsh 2026-09-18)
- * rejects any chat body that is not "agent-shaped": it must stream AND its
- * `tools` array must include function tools named "bash" AND "read"
- * (descriptions/parameters go uninspected). Plain conversations carry no tools
- * and would be 403'd, so the gateway injects the missing gate tools right
- * before dispatch.
+ * The OpenCode Zen anonymous free lane rejects any body that is not
+ * "agent-shaped": it must stream AND its `tools` array must include function
+ * tools named "bash" AND "read" (descriptions/parameters go uninspected —
+ * probed by opencode2dsh 2026-09-18 and re-confirmed on the Responses lane
+ * 2026-10-13: dropping the tools reintroduces the 403 even with valid ids).
+ * Plain conversations carry no tools and would be 403'd, so the gateway
+ * injects the missing gate tools right before dispatch.
+ *
+ * The 2026-10 tightening moved the lane itself: `-free` models are served on
+ * /v1/responses or /v1/chat/completions per model (muse-spark-* only speak
+ * responses; answers `ModelProtocolUnsupported` otherwise — the gateway flips
+ * and retries), and the lane now DECODES the correlation ids (see ids.ts) —
+ * `Bearer public` still authenticates once the ids are tU-shaped.
  *
  * This module rewrites the request BODY (not headers). The gateway calls it on
  * the parsed JSON payload before forwarding.
