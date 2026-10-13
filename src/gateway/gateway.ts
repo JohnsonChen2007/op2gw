@@ -149,10 +149,10 @@ export class Gateway {
 
     // The dialect upstream accepts is decided by the MODEL (Zen partitions its
     // endpoints strictly); the client may speak either one. See protocol.ts.
-    const wireApi = resolveUpstreamApi(model)
+    let wireApi = resolveUpstreamApi(model)
 
     // Force wire streaming (the free lane requires it) and inject gate tools.
-    const wireBody = this.#prepareBody(wireApi, req.api, { ...req.body, stream: true })
+    let wireBody = this.#prepareBody(wireApi, req.api, { ...req.body, stream: true })
 
     // Rotate budget: on a 429 (or other exit-shaped failure) we want to keep
     // hopping to a *different* IP until we run out of usable exits. So the
@@ -161,10 +161,17 @@ export class Gateway {
     // even for a tiny pool). This is what makes "rate-limited -> switch IP"
     // actually traverse the whole pool instead of giving up after 2-3 tries.
     const poolSize = this.#d.pool.size()
-    const maxAttempts = this.#d.poolEnabled
+    let maxAttempts = this.#d.poolEnabled
       ? Math.max(1, this.#d.maxRotateAttempts, poolSize)
       : 1
     const story: string[] = []
+    /**
+     * Set once we have flipped the wire dialect on upstream's objection.
+     * Zen answers `ModelProtocolUnsupported` when a model's dialect moved
+     * (free models keep migrating between the two endpoints — 2026-10-13);
+     * flipping beats burning the rotation budget on the wrong endpoint.
+     */
+    let apiFlipped = false
     let lastError: UpstreamError | Error | null = null
     /** Set when the CLIENT disconnected mid-request (as opposed to upstream failure). */
     let clientGone = false
@@ -264,6 +271,19 @@ export class Gateway {
           story.push(`#${attempt} ${exit.id} client_closed: disconnect before completion`)
           log.warn('client disconnected; abandoning request', { model, exit: exit.id, attempt })
           break
+        }
+
+        // Zen names the model's real dialect when our table is wrong: flip the
+        // wire API once and retry. The catalog carries no protocol metadata,
+        // so this upstream answer is the only authoritative source.
+        if (!apiFlipped && (err as UpstreamError).status === 400 && /ModelProtocolUnsupported/i.test((err as Error).message)) {
+          apiFlipped = true
+          // The flip deserves its own retry even when the rotation budget is 1.
+          maxAttempts += 1
+          wireApi = wireApi === 'responses' ? 'chat' : 'responses'
+          wireBody = this.#prepareBody(wireApi, req.api, { ...req.body, stream: true })
+          log.warn('upstream rejected the wire dialect; flipping api', { model, api: wireApi, exit: exit.id, attempt })
+          continue
         }
 
         const kind = (err as UpstreamError).kind ?? 'transport'

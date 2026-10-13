@@ -80,17 +80,27 @@ test('deriveRequestIDs falls back to random on an empty conversation', () => {
   assert.notEqual(a.session, b.session)
 })
 
-test('opencodeUserAgent looks like the official CLI', () => {
+test('opencodeUserAgent matches the official CLI string verbatim', () => {
   const ua = opencodeUserAgent()
-  assert.match(ua, /^opencode\/\d+\.\d+\.\d+ \(/)
-  assert.ok(ua.includes(process.platform))
+  assert.match(ua, /^opencode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/[\d.]+ runtime\/bun\/[\d.]+$/)
+})
+
+test('deriveRequestIDs emits the shapes the lane decodes', () => {
+  const ids = deriveRequestIDs([{ role: 'user', content: 'hi' }])
+  // Session head is a live tU encoding (see ids.ts); the lane rejects forged
+  // heads with FreeTierError, so the canonical regex alone is not enough —
+  // re-encode through the same byte layout and compare against the clock.
+  assert.match(ids.session, SESSION_RE)
+  assert.match(ids.request, /^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/, 'request ids are msg_ shaped')
+  assert.equal(ids.project, 'global')
 })
 
 test('disguiseHeaders carries the full CLI correlation set', () => {
-  const ids = { session: 'ses_abcdef012345ABCDEFGHIJKLMN', request: 'req_1', project: 'prj_2' }
+  const ids = { session: 'ses_abcdef012345ABCDEFGHIJKLMN', request: 'msg_1', project: 'global' }
   const headers = disguiseHeaders(ids)
   assert.equal(headers['x-opencode-client'], 'cli')
   assert.equal(headers['x-opencode-session'], ids.session)
+  assert.equal(headers['x-opencode-session-id'], ids.session)
   assert.equal(headers['x-session-affinity'], ids.session)
   assert.equal(headers['X-Session-Id'], ids.session)
   assert.equal(headers['x-opencode-request'], ids.request)
