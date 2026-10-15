@@ -2,15 +2,17 @@ import { request, type Dispatcher } from 'undici'
 import { Readable } from 'node:stream'
 
 import type { ExitNode, FailureKind, RequestIDs, UpstreamApi } from '../core/types.js'
-import { ANONYMOUS_KEY } from '../core/freelane.js'
 import { disguiseHeaders } from '../core/ids.js'
 import type { DispatcherCache } from '../pool/dispatchers.js'
 
 /**
- * Upstream forwarder: sends one prepared request to the OpenCode Zen anonymous
- * lane through a specific exit's dispatcher, with the CLI disguise headers and
- * `Authorization: Bearer public`. Returns the raw upstream response so the
- * gateway can stream it back verbatim (OpenAI-in / OpenAI-out, zero transcode).
+ * Upstream forwarder: sends one prepared request to the OpenCode Zen lane
+ * through a specific exit's dispatcher, with the CLI disguise headers and the
+ * configured credential (`Bearer <zenApiKey>` when set, else anonymous
+ * `Bearer public`). Returns the raw upstream response so the gateway can
+ * stream it back verbatim (OpenAI-in / OpenAI-out, zero transcode).
+ *
+ * Header key order mirrors the official CLI wire order.
  *
  * A body-idle watchdog wraps the response stream: neither undici's bodyTimeout
  * (we disable it) nor fetch owns silence detection once headers arrive, and a
@@ -36,6 +38,29 @@ export interface UpstreamError extends Error {
   status?: number
   /** Milliseconds the upstream asked us to back off (`Retry-After`), if any. */
   retryAfterMs?: number
+  /**
+   * True when the failure is the lane's identity gate (HTTP 403 carrying a
+   * FreeTierError, or the same verdict inside a 200 stream body). The exit is
+   * innocent — rotating to another exit cannot help — so the gateway fails
+   * fast instead of burning the rotation budget.
+   */
+  freeTier?: boolean
+}
+
+/** True when a message is the lane's "only from within OpenCode" verdict. */
+export function isFreeTierMessage(message: string): boolean {
+  return /freetier/i.test(message)
+}
+
+/**
+ * True when an upstream failure is the lane's identity gate: the flag set by
+ * the forwarder, or a FreeTierError carried in the synthesized message (the
+ * in-body 200-error path builds errors after `forwardUpstream` returned).
+ */
+export function isIdentityGate(err: unknown): boolean {
+  if (err === null || err === undefined) return false
+  const e = err as Partial<UpstreamError>
+  return e.freeTier === true || isFreeTierMessage(String(e.message ?? ''))
 }
 
 /**
@@ -90,6 +115,8 @@ export interface ForwardOptions {
   body: unknown
   exit: ExitNode
   dispatchers: DispatcherCache
+  /** Resolved upstream credential (key when configured, else `public`). */
+  apiKey: string
   signal?: AbortSignal
   /** Body-idle window (ms); 0 disables the watchdog. */
   bodyIdleMs?: number
@@ -119,11 +146,18 @@ export interface ForwardOptions {
 export async function forwardUpstream(options: ForwardOptions): Promise<UpstreamResult> {
   const url = `${options.zenBaseUrl.replace(/\/+$/, '')}${upstreamPath(options.api)}`
   const dispatcher: Dispatcher = options.dispatchers.forExit(options.exit)
+  // CLI wire order: authorization, content-type, user-agent, x-opencode-*
+  // (client, project, request, session), accept.
+  const disguise = disguiseHeaders(options.ids, options.api)
   const headers: Record<string, string> = {
-    ...disguiseHeaders(options.ids),
-    authorization: `Bearer ${ANONYMOUS_KEY}`,
+    authorization: `Bearer ${options.apiKey}`,
     'content-type': 'application/json',
-    accept: 'application/json, text/event-stream',
+    'user-agent': disguise['user-agent'],
+    'x-opencode-client': disguise['x-opencode-client'],
+    'x-opencode-project': disguise['x-opencode-project'],
+    'x-opencode-request': disguise['x-opencode-request'],
+    'x-opencode-session': disguise['x-opencode-session'],
+    accept: '*/*',
   }
 
   let res: Dispatcher.ResponseData
@@ -164,6 +198,7 @@ export async function forwardUpstream(options: ForwardOptions): Promise<Upstream
     e.kind = classifyStatus(res.statusCode, hint)
     e.status = res.statusCode
     e.retryAfterMs = parseRetryAfter(res.headers['retry-after'])
+    e.freeTier = res.statusCode === 403 && isFreeTierMessage(hint)
     throw e
   }
 

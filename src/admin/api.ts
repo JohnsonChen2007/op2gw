@@ -210,6 +210,13 @@ export async function handleAdmin(
       runtime.setLogLevel(body.logLevel as LogLevel)
       applied.logLevel = body.logLevel
     }
+    // Zen API key — live-applied to inference (takes effect on next request).
+    // The value is never echoed back; settings() only reports whether one is
+    // set. Empty string clears back to anonymous.
+    if (typeof body.zenApiKey === 'string') {
+      runtime.setZenApiKey(body.zenApiKey)
+      applied.zenApiKey = runtime.config.zenApiKey.trim() ? '(set)' : '(cleared: anonymous)'
+    }
     // Refresh cadence — live-applied to config; picked up on next cycle.
     if (typeof body.refreshSeconds === 'number' && body.refreshSeconds >= 1) {
       runtime.config.refreshSeconds = Math.floor(body.refreshSeconds)

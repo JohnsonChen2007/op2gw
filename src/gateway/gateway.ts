@@ -3,11 +3,11 @@ import { Readable } from 'node:stream'
 import type { Logger, ScopedLogger } from '../core/logger.js'
 import type { ExitNode, FailureKind, RequestIDs, RequestTrace, UpstreamApi } from '../core/types.js'
 import { deriveRequestIDs } from '../core/ids.js'
-import { ensureChatFreeLaneShape, ensureResponsesFreeLaneShape } from '../core/freelane.js'
+import { ensureChatFreeLaneShape, ensureResponsesFreeLaneShape, resolveUpstreamKey } from '../core/freelane.js'
 import { ModelCatalog } from '../catalog/catalog.js'
 import { ExitPool } from '../pool/pool.js'
 import { DispatcherCache } from '../pool/dispatchers.js'
-import { forwardUpstream, type UpstreamError, type UpstreamResult } from './upstream.js'
+import { forwardUpstream, isFreeTierMessage, isIdentityGate, type UpstreamError, type UpstreamResult } from './upstream.js'
 import {
   chatToResponsesBody,
   chatToResponsesCompletion,
@@ -55,6 +55,13 @@ export interface GatewayDeps {
   zenBaseUrl: string
   maxRotateAttempts: number
   poolEnabled: boolean
+  /**
+   * Resolves the upstream credential per request: a configured Zen API key, or
+   * '' for the anonymous `public` credential. Since the 2026-10 transport
+   * gating the anonymous lane rejects non-CLI stacks with FreeTierError, the
+   * keyed channel is the reliable path — see the fail-fast branch below.
+   */
+  getApiKey: () => string
   /**
    * Whether the machine's own egress may serve requests. false = every request
    * must leave through a proxy exit; direct egress is refused outright so
@@ -215,6 +222,7 @@ export class Gateway {
           body: wireBody,
           exit,
           dispatchers: this.#d.dispatchers,
+          apiKey: resolveUpstreamKey(this.#d.getApiKey()),
           signal: req.signal,
           bodyIdleMs: wireApi === 'responses' ? 300_000 : 120_000,
           firstByteMs: 30_000,
@@ -288,13 +296,21 @@ export class Gateway {
 
         const kind = (err as UpstreamError).kind ?? 'transport'
         const status = (err as UpstreamError).status
+        // The lane's identity gate (FreeTierError) is not an exit problem: the
+        // same fingerprint fails on every exit, so rotating only burns time
+        // and quota. Never penalize the exit, never rotate — surface it.
+        const identityGate = isIdentityGate(err)
         // A 400 from upstream is a client/request validation error (e.g. invalid param,
         // malformed prompt). It is NOT an exit/proxy node failure and must NOT penalize the exit.
-        if (status !== 400) {
+        if (status !== 400 && !identityGate) {
           this.#d.pool.markFailure(exit.id, model, kind)
         }
-        story.push(`#${attempt} ${exit.id} ${kind}: ${(err as Error).message.slice(0, 80)}`)
+        story.push(`#${attempt} ${exit.id} ${identityGate ? 'identity-gate' : kind}: ${(err as Error).message.slice(0, 80)}`)
         log.warn('attempt failed', { model, exit: exit.id, attempt, kind, error: (err as Error).message })
+        if (identityGate) {
+          // Fail fast: another exit cannot change the verdict.
+          break
+        }
         if (status === 400) {
           // Surface WHICH tool binding the provider rejected without logging
           // prompt content — the recurring 2026-10-01 400s rotated identically
@@ -369,6 +385,18 @@ export class Gateway {
       error: lastError?.message ?? 'unknown',
     }
     this.#d.logger.trace(trace)
+    // The identity gate fails on every exit by construction (it judges the
+    // client fingerprint, not the egress IP), so report it plainly with the
+    // remedy instead of a rotation story.
+    if (lastError && isIdentityGate(lastError)) {
+      throw new GatewayHttpError(
+        403,
+        'upstream_error',
+        'upstream rejected the anonymous request with FreeTierError (the anonymous lane only accepts the official OpenCode client since 2026-10). ' +
+          'Set a Zen API key via the OPENCODE_API_KEY environment variable (or config "zenApiKey") to use the keyed channel, which is unaffected. ' +
+          `Upstream detail: ${lastError.message.slice(0, 160)}`,
+      )
+    }
     const status = (lastError as UpstreamError)?.status ?? 502
     const detail = story.length > 1 ? `${lastError?.message} (op2gw rotated ${story.length - 1}x: ${story.join(' -> ')})` : lastError?.message ?? 'upstream failure'
     throw new GatewayHttpError(status >= 400 ? status : 502, 'upstream_error', detail)
@@ -775,6 +803,7 @@ function inBodyFailure(message: string): UpstreamError {
   const e = new Error(`upstream error in response body: ${message}`) as UpstreamError
   e.kind = classifyStreamError(message)
   e.status = 502
+  e.freeTier = isFreeTierMessage(message)
   return e
 }
 

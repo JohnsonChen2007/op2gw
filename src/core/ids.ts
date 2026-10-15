@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 
-import type { RequestIDs } from './types.js'
+import type { RequestIDs, UpstreamApi } from './types.js'
 
 /**
  * CLI-identical request disguise.
@@ -20,9 +20,18 @@ import type { RequestIDs } from './types.js'
  * sha-derived heads 403, tU-shaped heads 200, year-old/future timestamps
  * both accepted, so only the encoding is checked, not the clock).
  *
+ * The gate additionally requires the counter to stay small (live ablation by
+ * an independent proxy: counter 0-63 passes, 64+ is rejected), so minting
+ * rolls over to the next millisecond instead of emitting a large counter.
+ *
  * Conversations keep a stable session id through an LRU cache keyed by the
  * conversation seed, so multi-turn chats preserve upstream prompt-cache
  * affinity while different conversations separate cleanly.
+ *
+ * Header set + user agent captured byte-for-byte from the official OpenCode
+ * 1.18.18 CLI wire (2026-10-14). Note the CLI sends NO x-opencode-session-id /
+ * x-session-affinity / x-session-id headers on the provider path — only the
+ * five headers below.
  *
  * Semantics ported from the opencode-ai binary's id module (tU/u_/oU) and
  * opencode2dsh's adapter/ids.ts.
@@ -35,10 +44,16 @@ const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
 let lastMs = 0
 let counter = 0
 
+/** Largest counter the free-tier gate accepts (low 12 bits must stay ≥ 0xfc0). */
+const MAX_COUNTER = 63
+
 /**
  * One id in the official client's `tU()` shape: 12 hex timestamp head + 14
  * base62 random tail. `descending` mirrors the `~base` complement the CLI uses
  * for session ids; message ids use the plain ascending encoding.
+ *
+ * When more than MAX_COUNTER ids are minted within one millisecond we roll
+ * over to the next millisecond rather than emit a counter the gate rejects.
  */
 function tUId(descending: boolean, at: number = Date.now()): string {
   if (at !== lastMs) {
@@ -46,7 +61,11 @@ function tUId(descending: boolean, at: number = Date.now()): string {
     counter = 0
   }
   counter += 1
-  const base = BigInt(at) * 0x1000n + BigInt(counter)
+  if (counter > MAX_COUNTER) {
+    lastMs += 1
+    counter = 1
+  }
+  const base = BigInt(lastMs) * 0x1000n + BigInt(counter)
   const bits = descending ? ~base : base
   const head = Array.from({ length: 6 }, (_, i) => Number((bits >> BigInt(40 - 8 * i)) & 0xffn).toString(16).padStart(2, '0')).join('')
   const tail = Array.from(randomBytes(14), (x) => BASE62[x % 62]).join('')
@@ -128,25 +147,37 @@ export function deriveRequestIDs(messages: Array<{ role: string; content: unknow
   }
 }
 
+/** `@ai-sdk/provider-utils` version the CLI reports for each upstream dialect. */
+const PROVIDER_UTILS_VERSION: Record<UpstreamApi, string> = { chat: '4.0.23', responses: '4.0.38' }
+
 /**
- * CLI-identical user agent. The official binary ships exactly this string
- * (bun-compiled with `--user-agent=opencode/<version>` and the ai-sdk prefix
- * `@ai-sdk/provider-utils` appends); observed live 2026-10-13.
+ * CLI-identical user agent for one upstream dialect. Copied from the local
+ * OpenCode 1.18.18 CLI (captured 2026-10-14); the ai-sdk suffix version differs
+ * between `/chat/completions` and `/responses`.
  */
-export function opencodeUserAgent(): string {
-  return 'opencode/1.18.35 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14'
+export function opencodeUserAgent(api: UpstreamApi = 'chat'): string {
+  return `opencode/1.18.18 ai-sdk/provider-utils/${PROVIDER_UTILS_VERSION[api]} runtime/bun/1.3.14`
 }
 
-/** The full disguise header set for every upstream request. */
-export function disguiseHeaders(ids: RequestIDs): Record<string, string> {
+/** The full disguise header set for every upstream request.
+ *
+ * Key order mirrors the CLI wire order (authorization and content-type are
+ * added by the forwarder ahead of these; accept trails them).
+ */
+export interface DisguiseHeaders {
+  'user-agent': string
+  'x-opencode-client': string
+  'x-opencode-project': string
+  'x-opencode-request': string
+  'x-opencode-session': string
+}
+
+export function disguiseHeaders(ids: RequestIDs, api: UpstreamApi = 'chat'): DisguiseHeaders {
   return {
-    'user-agent': opencodeUserAgent(),
+    'user-agent': opencodeUserAgent(api),
     'x-opencode-client': 'cli',
-    'x-opencode-session': ids.session,
-    'x-opencode-session-id': ids.session,
-    'x-session-affinity': ids.session,
-    'X-Session-Id': ids.session,
-    'x-opencode-request': ids.request,
     'x-opencode-project': ids.project,
+    'x-opencode-request': ids.request,
+    'x-opencode-session': ids.session,
   }
 }

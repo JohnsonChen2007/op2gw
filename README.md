@@ -113,18 +113,34 @@ OpenAI 兼容客户端 (opencode / curl / SDK / 任意工具)
 │ 7. stream    上游 SSE 原样透传; 非流式客户端则重组为单个 JSON   │
 └────────────────────────────────────────────────────────────┘
    ▼
-https://opencode.ai/zen/v1/{chat/completions | responses}   (匿名免费通道)
+https://opencode.ai/inference/v1/{chat/completions | responses}   (匿名免费通道)
 ```
 
 对应源码：`gateway/gateway.ts`（编排）· `gateway/upstream.ts`（转发+看门狗）· `core/ids.ts`（伪装）· `core/freelane.ts`（门禁）· `catalog/catalog.ts`（目录）· `pool/*`（IP 池）。
 
-### 请求伪装：骗过免费层的两道门禁
+### 请求伪装：骗过免费层的门禁
 
-OpenCode Zen 免费层（经实测）有**两道校验，缺一即被 403 拒绝**，op2gw 逐一满足：
+OpenCode 把匿名免费通道迁到了 `https://opencode.ai/inference/v1`（旧的 `/zen/v1` 对匿名请求一律 403），并会逐项比对官方 CLI 的指纹。2026-10-15 与本机官方 CLI 1.18.18 同机、同出口逐项对照实测，**下面任何一项不符，所有出口都会 403 `FreeTierError`**（报错里「rotated 10x」只是每个出口都被同一个原因拒绝，与 IP 无关），op2gw 逐一满足：
 
-1. **会话形状门禁**（`core/ids.ts`）：`x-opencode-session` 必须是官方形状 `ses_ + 12位hex + 14位Base62`。网关取对话**首条 user 消息**内容 SHA-256 派生——多轮对话历史增长时会话 id 保持稳定（保留上游 prompt-cache 亲和），不同对话则自然分离。连同 CLI User-Agent 和 7 个关联头（`x-opencode-client/session/request/project` 等）一起发出，流量与官方 CLI 无法区分。
+1. **路径**：`/inference/v1/{chat/completions|responses}`（`core/config.ts` 的 `zenBaseUrl` 默认值）。
+2. **请求头**（`core/ids.ts`）：只发官方 CLI 实际发送的 `user-agent`、`x-opencode-client`、`x-opencode-session`、`x-opencode-request`、`x-opencode-project`。多发 `x-opencode-session-id`、`x-session-affinity`、`X-Session-Id` 会被拒。User-Agent 的 `opencode/<版本>` 必须落在上游认可的区间：低于 1.18.0 返回 `426`，实测 1.18.0–1.18.30 通过、1.18.34 及更高按伪造 403（旧值 1.18.35 正好落在被拒区间）；`ai-sdk` 后缀版本不校验。网关固定使用本机 CLI 的 `opencode/1.18.18`（chat 带 `provider-utils/4.0.23`，responses 带 `4.0.38`）。
+3. **会话 id 形状**（`core/ids.ts`）：`ses_`/`msg_` 后 12 位 hex 必须是 CLI 的 `tU()` 时间戳编码（随机 hex 视为伪造）。网关以对话**首条 user 消息**为种子缓存会话 id，多轮对话保持稳定（保留上游 prompt-cache 亲和），不同对话自然分离。
+4. **智能体形态门禁**（`core/freelane.ts`）：请求体必须「流式」且 `tools` 同时含 `bash`、`glob`、`grep`、`read`，并且这些工具的**描述与参数结构要与官方定义一致**（占位存根被拒；`$schema`、系统信息或临时目录这类细节不同则无妨）。网关发送前注入取自官方 CLI 的定义（`core/gate-tools.ts`），客户端自带的同名工具会被替换，其余工具保留。`tool_choice: "none"` 同样被拒，网关会改写为官方 CLI 始终发送的 `"auto"`。
 
-2. **智能体形态门禁**（`core/freelane.ts`）：请求体必须「流式」且 `tools` 数组同时含名为 `bash` 与 `read` 的 function 工具（描述/参数不查）。纯聊天没有工具会被拒，网关在发送前注入缺失的门禁工具存根；客户端本来没带工具时补 `tool_choice: 'none'` 防止模型真去调用它们。
+已知限制：注入的 `bash`/`glob`/`grep`/`read` 无法再用 `tool_choice: "none"` 压住，没有自带工具的纯聊天客户端在问到文件/命令时，模型仍可能对这些工具发起调用（实测加描述备注或 system 提示都压不住）。
+
+**官方 CLI 升级、再次出现全出口 403 时**，重新取证即可，不需要猜：
+
+```bash
+# 1. 起一个只落盘请求的本地服务（任意 http server，记录 headers + body）
+# 2. 用空 HOME 跑官方 CLI，把内置 opencode provider 的 baseURL 指过去
+mkdir -p /tmp/oc-home/.config/opencode
+echo '{"provider":{"opencode":{"options":{"baseURL":"http://127.0.0.1:18931/inference/v1"}}}}' \
+  > /tmp/oc-home/.config/opencode/opencode.jsonc
+HOME=/tmp/oc-home opencode run -m opencode/big-pickle hello
+```
+
+对照抓到的请求头、`tools[bash|read]` 与 `core/ids.ts`、`core/gate-tools.ts` 逐项更新；`opencode run -m opencode/muse-spark-1.3-contributor-free hello` 可取到 responses 方言。`~/.cache/opencode/models.json` 里 `opencode.api` 字段即当前上游基址。
 
 凭证就是字面量 `Authorization: Bearer public`，无需任何 key，不存储、无遥测。
 
@@ -227,7 +243,7 @@ OpenCode Zen 免费层（经实测）有**两道校验，缺一即被 403 拒绝
 | 字段 | 环境变量 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `host` / `port` | `OP2GW_HOST` / `OP2GW_PORT` | `127.0.0.1` / `8787` | 亦可 `--host` / `--port` |
-| `zenBaseUrl` | `OP2GW_ZEN_URL` | `https://opencode.ai/zen` | 上游地址 |
+| `zenBaseUrl` | `OP2GW_ZEN_URL` | `https://opencode.ai/inference` | 上游地址（旧的 `/zen` 对匿名请求已 403；`~/.op2gw/config.json` 里若固定了旧值需同步改掉） |
 | `refreshSeconds` | `OP2GW_REFRESH_SECONDS` | `300` | 实时目录刷新间隔 |
 | `logLevel` | `OP2GW_LOG_LEVEL` | `info` | debug/info/warn/error |
 | `pool.enabled` | `OP2GW_POOL_ENABLED` | `false` | `--pool` 开启 |

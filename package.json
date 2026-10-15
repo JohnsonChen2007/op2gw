@@ -41,5 +41,17 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
-  }
+  },
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JohnsonChen2007/op2gw.git"
+  },
+  "author": "",
+  "bugs": {
+    "url": "https://github.com/JohnsonChen2007/op2gw/issues"
+  },
+  "homepage": "https://github.com/JohnsonChen2007/op2gw#readme"
 }
