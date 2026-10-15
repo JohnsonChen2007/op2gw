@@ -150,18 +150,61 @@ test('the responses free-lane gate normalises a string input to an array', () =>
   const { body, injected } = ensureResponsesFreeLaneShape({ model: 'big-pickle', input: 'hi', stream: true })
   assert.equal(injected, true)
   const shaped = body as Record<string, unknown>
-  assert.ok(Array.isArray(shaped.input), 'a bare string input is wrapped so the gate tools still get injected')
+  assert.deepEqual(shaped.input, [{ role: 'user', content: [{ type: 'input_text', text: 'hi' }] }], 'a bare string becomes a user message')
   assert.equal(shaped.tool_choice, 'auto')
   const names = (shaped.tools as Array<Record<string, unknown>>).map((t) => t.name)
   assert.ok(names.includes('bash') && names.includes('read'))
 })
 
-test('the chat free-lane gate injects bash and read and pins tool_choice when the client had no tools', () => {
+test('the chat free-lane gate injects the official bash and read definitions and sets tool_choice auto', () => {
   const { body } = ensureChatFreeLaneShape({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] })
   const shaped = body as Record<string, unknown>
-  const names = (shaped.tools as Array<{ function: { name: string } }>).map((t) => t.function.name)
-  assert.ok(names.includes('bash') && names.includes('read'))
-  assert.equal(shaped.tool_choice, 'none')
+  const tools = shaped.tools as Array<{ function: { name: string; description: string; parameters: Record<string, unknown> } }>
+  const bash = tools.find((t) => t.function.name === 'bash')
+  assert.ok(bash && bash.function.description.length > 1000, 'a stub description is rejected by the lane')
+  assert.ok(tools.some((t) => t.function.name === 'read'))
+  assert.equal(shaped.tool_choice, 'auto', 'the CLI always sends auto; the lane 403s none')
+})
+
+test('the free-lane gate replaces a client stub bash with the official definition and keeps other tools', () => {
+  const stub = { type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object', properties: {} } } }
+  const other = { type: 'function', function: { name: 'grep', description: 'search', parameters: { type: 'object', properties: {} } } }
+  const { body } = ensureChatFreeLaneShape({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }], tools: [stub, other] })
+  const tools = (body as { tools: Array<{ function: { name: string; description: string } }> }).tools
+  const bash = tools.filter((t) => t.function.name === 'bash')
+  assert.equal(bash.length, 1, 'one bash tool after the rewrite')
+  assert.ok(bash[0]!.function.description.length > 1000, 'the official bash schema replaces the stub')
+  assert.ok(tools.some((t) => t.function.name === 'grep'), 'other client tools are kept')
+  assert.ok(tools.some((t) => t.function.name === 'read'))
+})
+
+test('the responses free-lane gate replaces a client stub bash with the official definition', () => {
+  const stub = { type: 'function', name: 'bash', description: 'run', parameters: { type: 'object', properties: {} } }
+  const { body } = ensureResponsesFreeLaneShape({ model: 'muse-spark-1.3-contributor-free', input: 'hi', tools: [stub] })
+  const tools = (body as { tools: Array<{ name: string; description: string; strict: boolean }> }).tools
+  const bash = tools.filter((t) => t.name === 'bash')
+  assert.equal(bash.length, 1)
+  assert.ok(bash[0]!.description.length > 1000)
+  assert.equal(bash[0]!.strict, false)
+})
+
+test('the chat free-lane gate coerces a client tool_choice "none" to auto (the lane 403s it) and keeps other choices', () => {
+  const weather = { type: 'function', function: { name: 'get_weather', description: 'w', parameters: { type: 'object', properties: {} } } }
+  const messages = [{ role: 'user', content: 'hi' }]
+  const none = ensureChatFreeLaneShape({ model: 'big-pickle', messages, tools: [weather], tool_choice: 'none' }).body as Record<string, unknown>
+  assert.equal(none.tool_choice, 'auto', 'none is coerced to the CLI default')
+  const noneNoTools = ensureChatFreeLaneShape({ model: 'big-pickle', messages, tool_choice: 'none' }).body as Record<string, unknown>
+  assert.equal(noneNoTools.tool_choice, 'auto')
+  for (const choice of ['auto', 'required', { type: 'function', function: { name: 'get_weather' } }]) {
+    const kept = ensureChatFreeLaneShape({ model: 'big-pickle', messages, tools: [weather], tool_choice: choice }).body as Record<string, unknown>
+    assert.deepEqual(kept.tool_choice, choice, 'choices the lane accepts pass through untouched')
+  }
+})
+
+test('the gate tool definitions carry no machine-specific paths', () => {
+  const { body } = ensureChatFreeLaneShape({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }] })
+  const wire = JSON.stringify(body)
+  assert.doesNotMatch(wire, /\/var\/folders|\/Users\/esadmin/)
 })
 
 /**

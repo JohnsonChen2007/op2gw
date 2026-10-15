@@ -80,9 +80,11 @@ test('deriveRequestIDs falls back to random on an empty conversation', () => {
   assert.notEqual(a.session, b.session)
 })
 
-test('opencodeUserAgent matches the official CLI string verbatim', () => {
+test('opencodeUserAgent matches the official CLI string verbatim, per dialect', () => {
   const ua = opencodeUserAgent()
   assert.match(ua, /^opencode\/\d+\.\d+\.\d+ ai-sdk\/provider-utils\/[\d.]+ runtime\/bun\/[\d.]+$/)
+  assert.equal(opencodeUserAgent('chat'), 'opencode/1.18.18 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14')
+  assert.equal(opencodeUserAgent('responses'), 'opencode/1.18.18 ai-sdk/provider-utils/4.0.38 runtime/bun/1.3.14')
 })
 
 test('deriveRequestIDs emits the shapes the lane decodes', () => {
@@ -95,15 +97,13 @@ test('deriveRequestIDs emits the shapes the lane decodes', () => {
   assert.equal(ids.project, 'global')
 })
 
-test('disguiseHeaders carries the full CLI correlation set', () => {
+test('disguiseHeaders carries the local CLI correlation set', () => {
   const ids = { session: 'ses_abcdef012345ABCDEFGHIJKLMN', request: 'msg_1', project: 'global' }
-  const headers = disguiseHeaders(ids)
+  const headers = disguiseHeaders(ids, 'responses')
+  assert.deepEqual(Object.keys(headers).sort(), ['user-agent', 'x-opencode-client', 'x-opencode-project', 'x-opencode-request', 'x-opencode-session'])
   assert.equal(headers['x-opencode-client'], 'cli')
   assert.equal(headers['x-opencode-session'], ids.session)
-  assert.equal(headers['x-opencode-session-id'], ids.session)
-  assert.equal(headers['x-session-affinity'], ids.session)
-  assert.equal(headers['X-Session-Id'], ids.session)
   assert.equal(headers['x-opencode-request'], ids.request)
   assert.equal(headers['x-opencode-project'], ids.project)
-  assert.ok(typeof headers['user-agent'] === 'string' && headers['user-agent'].startsWith('opencode/'))
+  assert.equal(headers['user-agent'], opencodeUserAgent('responses'))
 })

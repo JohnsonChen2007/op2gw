@@ -136,6 +136,9 @@ export class Runtime {
       maxRotateAttempts: config.pool.maxRotateAttempts,
       poolEnabled: config.pool.enabled,
       directAllowed: config.pool.includeDirect,
+      // Read per request so a hot-swapped key (settings page, no restart)
+      // takes effect on the very next inference call.
+      getApiKey: () => this.config.zenApiKey,
       // Non-streaming bodies have no idle watchdog, so this budget is the only
       // thing keeping a half-open upstream from hanging a request forever.
       bodyBudgetMs: config.bodyBudgetMs,
@@ -294,6 +297,15 @@ export class Runtime {
   setLogLevel(level: Op2gwConfig['logLevel']): void {
     this.config.logLevel = level
     this.logger.setLevel(level)
+  }
+
+  /**
+   * Live-set the upstream Zen API key (takes effect on the next request; the
+   * value itself is never logged). Empty string = back to anonymous.
+   */
+  setZenApiKey(key: string): void {
+    this.config.zenApiKey = key.trim()
+    this.logger.child('runtime').info('zen api key updated', { anonymous: this.config.zenApiKey === '' })
   }
 
   /**
@@ -457,6 +469,10 @@ export class Runtime {
     pinnedExitId: string
     /** Whether direct egress is included in the pool. */
     includeDirect: boolean
+    /** Whether an upstream Zen API key is configured (value never exposed). */
+    zenApiKeySet: boolean
+    /** Effective upstream credential mode (for display). */
+    authMode: 'key' | 'anonymous'
   } {
     return {
       host: this.config.host,
@@ -470,6 +486,8 @@ export class Runtime {
       proxyPool: [...this.config.pool.manual],
       pinnedExitId: this.config.pool.pinnedExitId,
       includeDirect: this.config.pool.includeDirect,
+      zenApiKeySet: this.config.zenApiKey.trim().length > 0,
+      authMode: this.config.zenApiKey.trim().length > 0 ? 'key' : 'anonymous',
     }
   }
 

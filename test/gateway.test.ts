@@ -161,6 +161,7 @@ function makeGateway(
     zenBaseUrl,
     maxRotateAttempts: opts.maxRotateAttempts ?? 3,
     poolEnabled: opts.poolEnabled,
+    getApiKey: () => '',
     onPoolStarved: opts.onPoolStarved,
     bodyBudgetMs: opts.bodyBudgetMs,
   })
@@ -217,7 +218,25 @@ test('forwards a chat stream with CLI disguise and gate tools', async () => {
   assert.equal(wire.stream, true, 'the free lane requires wire streaming')
   const names = chatToolNames(wire)
   assert.ok(names.includes('bash') && names.includes('read'), 'gate tools injected')
-  assert.equal(wire.tool_choice, 'none', 'injected stubs are never callable')
+  assert.equal(wire.tool_choice, 'auto', 'the lane 403s tool_choice none; the CLI always sends auto')
+})
+
+test('sends only the CLI header set and never forwards a client tool_choice "none"', async () => {
+  const { url, seen } = await startZen((_seen, res) => sse(200, chatSse(CHAT_MODEL, 'Hello'), res))
+  const { gateway } = makeGateway(url)
+  const result = await gateway.handle({
+    api: 'chat',
+    body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }], tool_choice: 'none' },
+    clientStream: true,
+  })
+  await collect(result.body)
+  const hit = seen[0]!
+  // The lane 403s any extra session header the real CLI does not send.
+  for (const extra of ['x-opencode-session-id', 'x-session-affinity', 'x-session-id']) {
+    assert.equal(hit.headers[extra], undefined, `${extra} must not be sent`)
+  }
+  assert.ok(hit.headers['x-opencode-request'] && hit.headers['x-opencode-project'], 'CLI correlation headers present')
+  assert.equal((hit.body as Record<string, unknown>).tool_choice, 'auto', 'tool_choice none is coerced to auto on the wire')
 })
 
 test('aggregates a non-streaming chat response into one JSON body', async () => {

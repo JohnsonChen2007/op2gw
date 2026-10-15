@@ -18,8 +18,18 @@ export interface Op2gwConfig {
   host: string
   /** HTTP listen port. Default 8787. */
   port: number
-  /** Upstream base, default https://opencode.ai/zen . */
+  /** Upstream base, default https://opencode.ai/inference (the anonymous free
+   *  lane moved off `/zen`, which now 403s every anonymous request). */
   zenBaseUrl: string
+  /**
+   * Upstream Zen API key. Empty = anonymous (`Bearer public`).
+   *
+   * Since the 2026-10 transport gating the anonymous lane rejects non-CLI
+   * stacks with FreeTierError, a key is the reliable path: set it via the
+   * OPENCODE_API_KEY environment variable (same name the CLI uses) or this
+   * field. The keyed channel is unaffected by the gate.
+   */
+  zenApiKey: string
   /** models.dev metadata endpoint. */
   metadataUrl: string
   /** Live catalog refresh cadence (seconds). */
@@ -91,7 +101,8 @@ export function defaultConfig(): Op2gwConfig {
   return {
     host: '127.0.0.1',
     port: 8787,
-    zenBaseUrl: 'https://opencode.ai/zen',
+    zenBaseUrl: 'https://opencode.ai/inference',
+    zenApiKey: '',
     metadataUrl: 'https://models.dev/api.json',
     refreshSeconds: 300,
     // Generous: this only has to be shorter than "forever". A non-streaming
@@ -175,6 +186,8 @@ export async function loadConfig(argv: string[] = process.argv.slice(2)): Promis
   cfg.host = env.OP2GW_HOST ?? cfg.host
   cfg.port = coerceNum(env.OP2GW_PORT, cfg.port)
   cfg.zenBaseUrl = env.OP2GW_ZEN_URL ?? cfg.zenBaseUrl
+  // Same variable name the official CLI uses, so one export serves both.
+  if (env.OPENCODE_API_KEY !== undefined) cfg.zenApiKey = env.OPENCODE_API_KEY.trim()
   cfg.refreshSeconds = coerceNum(env.OP2GW_REFRESH_SECONDS, cfg.refreshSeconds)
   cfg.bodyBudgetMs = coerceNum(env.OP2GW_BODY_BUDGET_MS, cfg.bodyBudgetMs)
   cfg.logLevel = (env.OP2GW_LOG_LEVEL as LogLevel) ?? cfg.logLevel
@@ -230,6 +243,7 @@ export async function saveConfig(cfg: Op2gwConfig): Promise<string> {
     host: cfg.host,
     port: cfg.port,
     zenBaseUrl: cfg.zenBaseUrl,
+    zenApiKey: cfg.zenApiKey,
     refreshSeconds: cfg.refreshSeconds,
     bodyBudgetMs: cfg.bodyBudgetMs,
     logLevel: cfg.logLevel,
