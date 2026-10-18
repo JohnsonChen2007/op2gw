@@ -151,6 +151,7 @@ function makeGateway(
     list: () => [...free],
     decision: (m: string) =>
       free.has(m) ? { allowed: true, source: 'test', known: true } : { allowed: false, source: 'test_blocked', known: true },
+    limits: () => undefined,
   }
   const gateway = new Gateway({
     logger,
@@ -563,4 +564,49 @@ test('a client disconnect mid-flight ends as 499 without punishing the exit', as
     (err: unknown) => err instanceof GatewayHttpError && err.status === 499 && err.type === 'client_closed_request',
   )
   assert.equal(pool.usableCount(CHAT_MODEL), before, 'the exit is untouched after a client disconnect')
+})
+
+test('identity-gate 403 rotates through the pool instead of failing fast', async () => {
+  // 2026-10-18: the lane's FreeTierError judges the egress IP, so a gate hit
+  // must cool that exit and rotate — not end the request (the Oct-15 regime).
+  const freeTier = {
+    type: 'error',
+    error: { type: 'FreeTierError', message: "OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai" },
+  }
+  const { url, seen } = await startZen((_s, res) => json(403, freeTier, res))
+  const exits = ['http://e1:1', 'http://e2:1', 'http://e3:1']
+  const { gateway, pool } = makeGateway(url, { poolEnabled: true, exits, maxRotateAttempts: 1 })
+  await assert.rejects(
+    gateway.handle({
+      api: 'chat',
+      body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+      clientStream: true,
+    }),
+    (err: unknown) =>
+      err instanceof GatewayHttpError &&
+      err.status === 403 &&
+      /every exit tried/.test(err.message) &&
+      /Rotated:.*identity-gate.*identity-gate.*identity-gate/.test(err.message),
+  )
+  assert.equal(seen.length, 3, 'one gate attempt per distinct exit, no fail-fast')
+  for (const id of exits) {
+    const v = pool.view().find((x) => x.id === id)!
+    assert.ok(v.cooling, `gated exit ${id} is cooled for the next request`)
+  }
+})
+
+test('a cooled gate verdict keeps the next request off that exit', async () => {
+  const { url } = await startZen((_s, res) => sse(200, chatSse(CHAT_MODEL, 'ok'), res))
+  const exits = ['http://e1:1', 'http://e2:1']
+  const { gateway, pool } = makeGateway(url, { poolEnabled: true, exits, maxRotateAttempts: 1 })
+  // Simulate the lane's verdict recorded by a previous request, then route a
+  // fresh conversation: the cooled e1 must be skipped in favor of e2.
+  pool.markGate('http://e1:1', CHAT_MODEL)
+  const r1 = await gateway.handle({
+    api: 'chat',
+    body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'one' }] },
+    clientStream: true,
+  })
+  await collect(r1.body)
+  assert.equal(r1.trace.exit, 'http://e2:1', 'the gated exit is skipped, rotation lands on the healthy one')
 })

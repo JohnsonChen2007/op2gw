@@ -8,6 +8,7 @@ import { ModelCatalog } from '../catalog/catalog.js'
 import { ExitPool } from '../pool/pool.js'
 import { DispatcherCache } from '../pool/dispatchers.js'
 import { forwardUpstream, isFreeTierMessage, isIdentityGate, type UpstreamError, type UpstreamResult } from './upstream.js'
+import { wrapInstantLengthGuard, type InstantLengthGuardOptions } from './length-guard.js'
 import {
   chatToResponsesBody,
   chatToResponsesCompletion,
@@ -243,11 +244,25 @@ export class Gateway {
         let body: Readable
         if (req.clientStream) {
           await this.#inspectPreContentError(wireApi, result, model, exit.id, log)
+          // Chat wire only: the guard watches chat SSE finish_reason frames.
+          // The Responses wire models (`muse-spark-*`) never emit this shape
+          // and keep their own incomplete semantics.
+          if (wireApi === 'chat') {
+            result.body = wrapInstantLengthGuard(result.body, this.#lengthGuardOptions(model))
+          }
           body = this.#toClientStream(req.api, wireApi, result.body, model)
         } else {
           // Aggregation throws an UpstreamError on an in-body error, so a
           // non-streaming client gets a real status code and a retry instead of
-          // HTTP 200 wrapping an error object.
+          // HTTP 200 wrapping an error object. The guard throws BEFORE the
+          // aggregator can wrap it, so the overflow keeps its non-rotatable
+          // 400 instead of burning the rotation budget as a vague 5xx.
+          if (wireApi === 'chat') {
+            result.rawBody = wrapInstantLengthGuard(result.rawBody, {
+              ...this.#lengthGuardOptions(model),
+              throwOnConvert: true,
+            })
+          }
           body = await this.#toClientCompletion(req.api, wireApi, result.rawBody, model)
         }
 
@@ -296,21 +311,23 @@ export class Gateway {
 
         const kind = (err as UpstreamError).kind ?? 'transport'
         const status = (err as UpstreamError).status
-        // The lane's identity gate (FreeTierError) is not an exit problem: the
-        // same fingerprint fails on every exit, so rotating only burns time
-        // and quota. Never penalize the exit, never rotate — surface it.
+        // The lane's identity gate (FreeTierError) JUDGES THE EGRESS IP: the
+        // 2026-10-18 ablation sent the byte-identical disguised request through
+        // the pool and got 403 on some exits while others streamed 200 in the
+        // same second (10808/21001 refused, 21002 passed). The Oct-15 "same
+        // fingerprint fails everywhere, fail fast" regime is over: a gate hit
+        // now penalizes the exit (escalating cooldown that survives
+        // reachability probes) and rotates.
         const identityGate = isIdentityGate(err)
         // A 400 from upstream is a client/request validation error (e.g. invalid param,
         // malformed prompt). It is NOT an exit/proxy node failure and must NOT penalize the exit.
-        if (status !== 400 && !identityGate) {
+        if (identityGate) {
+          this.#d.pool.markGate(exit.id, model)
+        } else if (status !== 400) {
           this.#d.pool.markFailure(exit.id, model, kind)
         }
         story.push(`#${attempt} ${exit.id} ${identityGate ? 'identity-gate' : kind}: ${(err as Error).message.slice(0, 80)}`)
         log.warn('attempt failed', { model, exit: exit.id, attempt, kind, error: (err as Error).message })
-        if (identityGate) {
-          // Fail fast: another exit cannot change the verdict.
-          break
-        }
         if (status === 400) {
           // Surface WHICH tool binding the provider rejected without logging
           // prompt content — the recurring 2026-10-01 400s rotated identically
@@ -326,6 +343,7 @@ export class Gateway {
         // named by the provider (`unknown variant developer`, `tool_call_id`,
         // `encrypted_content`), so the field-less message is the safe key.
         const rotatable =
+          identityGate ||
           (status !== 400 &&
             (kind === 'limited' || kind === 'transport' || kind === 'server' || kind === 'refused' || kind === 'region')) ||
           (status === 400 && isVagueProvider400((err as Error).message))
@@ -385,16 +403,19 @@ export class Gateway {
       error: lastError?.message ?? 'unknown',
     }
     this.#d.logger.trace(trace)
-    // The identity gate fails on every exit by construction (it judges the
-    // client fingerprint, not the egress IP), so report it plainly with the
-    // remedy instead of a rotation story.
+    // Every exit tried was refused by the lane's identity gate. The verdict is
+    // per egress IP (2026-10-18), so this only happens when the rotation budget
+    // kept landing on gated exits — report the plain verdict plus the remedy
+    // (a key sidesteps the gate), and list the exits so ops can pin a passing one.
     if (lastError && isIdentityGate(lastError)) {
       throw new GatewayHttpError(
         403,
         'upstream_error',
-        'upstream rejected the anonymous request with FreeTierError (the anonymous lane only accepts the official OpenCode client since 2026-10). ' +
+        'upstream rejected the anonymous request with FreeTierError from every exit tried ' +
+          '(the 2026-10 lane judges the egress IP: these exits are refused, others may pass — ' +
+          'retry soon or pin a passing exit). ' +
           'Set a Zen API key via the OPENCODE_API_KEY environment variable (or config "zenApiKey") to use the keyed channel, which is unaffected. ' +
-          `Upstream detail: ${lastError.message.slice(0, 160)}`,
+          `Rotated: ${story.join(' -> ')}. Upstream detail: ${lastError.message.slice(0, 160)}`,
       )
     }
     const status = (lastError as UpstreamError)?.status ?? 502
@@ -513,6 +534,21 @@ export class Gateway {
   #toClientStream(clientApi: UpstreamApi, wireApi: UpstreamApi, source: Readable, model: string): Readable {
     if (clientApi === wireApi) return source
     return wireApi === 'responses' ? responsesToChatStream(source, model) : chatToResponsesStream(source, model)
+  }
+
+  /** Guard options shared by the streaming and aggregating chat-wire paths. */
+  #lengthGuardOptions(model: string): InstantLengthGuardOptions {
+    return {
+      model,
+      contextWindow: this.#d.catalog.limits(model)?.contextWindow,
+      onConvert: (info) => {
+        this.#d.scoped.warn('upstream instant-length truncation converted to context_length_exceeded', {
+          model,
+          promptTokens: info.promptTokens,
+          completionTokens: info.completionTokens,
+        })
+      },
+    }
   }
 
   /** Wire body -> single JSON in the client dialect. */

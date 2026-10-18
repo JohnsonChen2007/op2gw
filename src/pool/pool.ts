@@ -21,9 +21,14 @@ interface ExitHealth {
   cooldownUntil: number
   /** Why the current cooldown was raised: 'limited' (429 quota backoff — must
    *  never be cleared by a reachability probe) vs 'transport' (connectivity —
-   *  a successful multi-site probe clears it immediately). */
-  cooldownReason: 'limited' | 'transport'
+   *  a successful multi-site probe clears it immediately) vs 'gate' (the lane's
+   *  identity gate refused this egress IP — a reachability probe says nothing
+   *  about it, so only TTL expiry plus a fresh lane request can revive). */
+  cooldownReason: 'limited' | 'transport' | 'gate'
   consecutiveLimited: number
+  /** Consecutive identity-gate verdicts on the request path; drives the
+   *  escalating 'gate' cooldown (same math as 'limited'). */
+  consecutiveGate: number
   deadStrikes: number
   inflight: boolean
 }
@@ -142,6 +147,7 @@ export class ExitPool {
         cooldownUntil: 0,
         cooldownReason: 'limited',
         consecutiveLimited: 0,
+        consecutiveGate: 0,
         deadStrikes: 0,
         inflight: false,
       })
@@ -340,11 +346,33 @@ export class ExitPool {
     }
   }
 
+  /** Record a lane identity-gate verdict (FreeTierError).
+   *
+   *  The 2026-10-18 ablation showed the gate judges the EGRESS IP, not the
+   *  request: the byte-identical disguised call 403s on some exits and streams
+   *  200 on others (live probe: 10808/21001 403, 21002 200, same second). So
+   *  the verdict is an exit problem — cool the exit (escalating, like 429s: a
+   *  reachability probe proves the tunnel but not the lane's opinion, so the
+   *  cooldown must survive probes) and ban the exit×model pair outright so the
+   *  rotation lands on another exit immediately.
+   */
+  markGate(exitId: string, model: string): void {
+    this.#banModel(exitId, model, true)
+    const health = this.#health.get(exitId)
+    if (!health) return
+    const now = this.#now()
+    health.consecutiveGate += 1
+    const factor = Math.min(2 ** (health.consecutiveGate - 1), 10)
+    health.cooldownUntil = now + this.#cooldownMs * factor
+    health.cooldownReason = 'gate'
+  }
+
   markSuccess(exitId: string, model: string): void {
     const health = this.#health.get(exitId)
     if (health) {
       health.state = 'ok'
       health.consecutiveLimited = 0
+      health.consecutiveGate = 0
       health.cooldownUntil = 0
       health.deadStrikes = 0
     }

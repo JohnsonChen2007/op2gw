@@ -40,9 +40,10 @@ export interface UpstreamError extends Error {
   retryAfterMs?: number
   /**
    * True when the failure is the lane's identity gate (HTTP 403 carrying a
-   * FreeTierError, or the same verdict inside a 200 stream body). The exit is
-   * innocent — rotating to another exit cannot help — so the gateway fails
-   * fast instead of burning the rotation budget.
+   * FreeTierError, or the same verdict inside a 200 stream body). Since
+   * 2026-10-18 the verdict is per egress IP (identical requests 403 on gated
+   * exits and stream 200 through others), so the gateway cools the exit and
+   * rotates instead of failing fast.
    */
   freeTier?: boolean
 }

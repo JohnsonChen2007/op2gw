@@ -120,12 +120,14 @@ https://opencode.ai/inference/v1/{chat/completions | responses}   (匿名免费�
 
 ### 请求伪装：骗过免费层的门禁
 
-OpenCode 把匿名免费通道迁到了 `https://opencode.ai/inference/v1`（旧的 `/zen/v1` 对匿名请求一律 403），并会逐项比对官方 CLI 的指纹。2026-10-15 与本机官方 CLI 1.18.18 同机、同出口逐项对照实测，**下面任何一项不符，所有出口都会 403 `FreeTierError`**（报错里「rotated 10x」只是每个出口都被同一个原因拒绝，与 IP 无关），op2gw 逐一满足：
+OpenCode 把匿名免费通道迁到了 `https://opencode.ai/inference/v1`（旧的 `/zen/v1` 对匿名请求一律 403），并会逐项比对官方 CLI 的指纹。2026-10-15 与本机官方 CLI 1.18.18 同机、同出口逐项对照实测，**下面任何一项不符，该请求在所有出口都会 403 `FreeTierError`**，op2gw 逐一满足：
 
 1. **路径**：`/inference/v1/{chat/completions|responses}`（`core/config.ts` 的 `zenBaseUrl` 默认值）。
 2. **请求头**（`core/ids.ts`）：只发官方 CLI 实际发送的 `user-agent`、`x-opencode-client`、`x-opencode-session`、`x-opencode-request`、`x-opencode-project`。多发 `x-opencode-session-id`、`x-session-affinity`、`X-Session-Id` 会被拒。User-Agent 的 `opencode/<版本>` 必须落在上游认可的区间：低于 1.18.0 返回 `426`，实测 1.18.0–1.18.30 通过、1.18.34 及更高按伪造 403（旧值 1.18.35 正好落在被拒区间）；`ai-sdk` 后缀版本不校验。网关固定使用本机 CLI 的 `opencode/1.18.18`（chat 带 `provider-utils/4.0.23`，responses 带 `4.0.38`）。
 3. **会话 id 形状**（`core/ids.ts`）：`ses_`/`msg_` 后 12 位 hex 必须是 CLI 的 `tU()` 时间戳编码（随机 hex 视为伪造）。网关以对话**首条 user 消息**为种子缓存会话 id，多轮对话保持稳定（保留上游 prompt-cache 亲和），不同对话自然分离。
 4. **智能体形态门禁**（`core/freelane.ts`）：请求体必须「流式」且 `tools` 同时含 `bash`、`glob`、`grep`、`read`，并且这些工具的**描述与参数结构要与官方定义一致**（占位存根被拒；`$schema`、系统信息或临时目录这类细节不同则无妨）。网关发送前注入取自官方 CLI 的定义（`core/gate-tools.ts`），客户端自带的同名工具会被替换，其余工具保留。`tool_choice: "none"` 同样被拒，网关会改写为官方 CLI 始终发送的 `"auto"`。
+
+**门禁第四维：出口 IP。** 2026-10-18 实测（`scripts/probe-path.mjs`、`scripts/probe-ua-window.mjs`）：逐项满足以上四条的同一个匿名请求，从部分出口 IP 403 `FreeTierError`（含默认出口 10808、池内多个出口），从另一些出口同秒 200——与 UA 版本无关（1.17.9–1.20.0 全档 403），是被按 egress 判定放行与否。网关的处理（`pool/pool.ts` 的 `markGate` + `gateway/gateway.ts`）：身份门禁 403 **按出口惩罚并轮换**——该「出口×模型」立即封禁，出口整体进入指数冷却（冷却理由 `gate`，可达性探活不清除：隧道活着不代表 lane 放行），剩余预算继续在全池找通过的出口；此前的「指纹问题、fail-fast 不轮换」策略已废弃。若需要立即稳定，把 `pool.pinnedExitId` 钉到已验证通过的出口（实测 2026-10-18：`socks5://127.0.0.1:21002` 通过，`/admin/pool` 可见各出口冷却状态）。`GET {zen}/v1/models`（目录 S1）不受此门禁影响。
 
 已知限制：注入的 `bash`/`glob`/`grep`/`read` 无法再用 `tool_choice: "none"` 压住，没有自带工具的纯聊天客户端在问到文件/命令时，模型仍可能对这些工具发起调用（实测加描述备注或 system 提示都压不住）。
 

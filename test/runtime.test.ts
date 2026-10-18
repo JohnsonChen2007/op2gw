@@ -169,7 +169,7 @@ test('Runtime with includeDirect: false excludes direct from pool and routes str
       async () => {
         await rt.gateway.handle({
           api: 'chat',
-          body: { model: 'mimo-v2.5-free', messages: [{ role: 'user', content: 'hi' }] },
+          body: { model: 'mimo-v2.6-flash-free', messages: [{ role: 'user', content: 'hi' }] },
           clientStream: true,
         })
       },

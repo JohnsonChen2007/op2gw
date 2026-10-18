@@ -292,3 +292,30 @@ test('setIncludeDirect(false) removes direct and ensures pick never returns it',
   assert.equal(pool.pick('m', 'sess')?.exit.id, 'direct')
 })
 
+
+test('markGate: cools the exit, bans the pair, survives probes, escalates', () => {
+  let now = 1_000_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://a:1'))
+  pool.markGate('http://a:1', 'm')
+  assert.equal(pool.isUsable('http://a:1', 'm'), false, 'exit×model pair banned immediately')
+  assert.equal(pool.isUsable('http://a:1', 'other'), false, 'exit-level cooldown covers other models too')
+
+  // A reachability probe proves the tunnel, not the lane's opinion: the 'gate'
+  // cooldown must survive it (only 'transport' is lifted on a good probe).
+  pool.markProbe('http://a:1', true, 10, '1.2.3.4')
+  assert.equal(pool.isUsable('http://a:1', 'other'), false, 'gate cooldown survives a healthy probe')
+
+  // Past the first window, a second gate verdict escalates to 2x the cooldown.
+  now += 60_000
+  pool.markGate('http://a:1', 'm')
+  const view = pool.view().find((v) => v.id === 'http://a:1')!
+  assert.equal(view.cooling, true)
+  assert.equal(view.cooldownRemainingMs, 120_000, 'second consecutive gate doubles the cooldown')
+
+  // A real success through the lane resets everything.
+  pool.markSuccess('http://a:1', 'm')
+  assert.equal(pool.isUsable('http://a:1', 'm'), true)
+  const v2 = pool.view().find((v) => v.id === 'http://a:1')!
+  assert.equal(v2.cooling, false)
+})

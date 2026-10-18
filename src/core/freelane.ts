@@ -190,10 +190,12 @@ export const ANONYMOUS_KEY = 'public'
 
 /**
  * Resolve the upstream credential: a configured Zen API key wins, otherwise
- * the anonymous `public` credential. Since the 2026-10 transport gating the
- * anonymous lane rejects non-CLI TLS stacks with FreeTierError, operators who
- * hit that wall should set a key (env OPENCODE_API_KEY, config `zenApiKey`);
- * the keyed channel is unaffected by the gate.
+ * the anonymous `public` credential. The 2026-10 gate judges the ANONYMOUS
+ * request per egress IP (2026-10-18 ablation: identical disguised calls 403
+ * from datacenter exits, 200 through others), which the gateway handles by
+ * cooling gated exits and rotating. Operators who want a verdict that does
+ * not depend on the exit pool should set a key (env OPENCODE_API_KEY, config
+ * `zenApiKey`); the keyed channel is unaffected by the gate.
  */
 export function resolveUpstreamKey(configured: string | undefined): string {
   const trimmed = (configured ?? '').trim()

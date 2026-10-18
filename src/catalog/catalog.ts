@@ -5,7 +5,7 @@ import type { ScopedLogger } from '../core/logger.js'
 import { opencodeUserAgent } from '../core/ids.js'
 import { ANONYMOUS_KEY } from '../core/freelane.js'
 import type { FreeDecision } from '../core/types.js'
-import { fallbackFreeModels, verifiedFreeModels, disabledModels } from './static-models.js'
+import { fallbackFreeModels, verifiedFreeModels, disabledModels, contextWindowOverrides, maxOutputOverride } from './static-models.js'
 
 /**
  * Model catalog with the S1/S2/S3 fallback chain.
@@ -58,6 +58,8 @@ export interface CatalogOptions {
   fetchImpl?: typeof fetch
   now?: () => number
   staleMs?: number
+  /** Per-request deadline for the S1/S2 fetches. Default 30s. */
+  fetchTimeoutMs?: number
   onRefresh?: (snapshot: CatalogSnapshot) => void
 }
 
@@ -189,12 +191,14 @@ export class ModelCatalog {
   readonly #fetch: typeof fetch
   readonly #now: () => number
   readonly #staleMs: number
+  readonly #fetchTimeoutMs: number
 
   constructor(options: CatalogOptions) {
     this.#opts = options as never
     this.#fetch = options.fetchImpl ?? fetch
     this.#now = options.now ?? Date.now
     this.#staleMs = options.staleMs ?? 10 * 60_000
+    this.#fetchTimeoutMs = options.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
   }
 
   async start(): Promise<void> {
@@ -250,16 +254,14 @@ export class ModelCatalog {
 
   async #fetchZenModels(): Promise<string[]> {
     const url = `${this.#opts.zenBaseUrl.replace(/\/+$/, '')}/v1/models`
-    const res = await this.#withTimeout(
-      this.#fetch(url, {
-        headers: {
-          authorization: `Bearer ${ANONYMOUS_KEY}`,
-          'user-agent': opencodeUserAgent(),
-          'x-opencode-client': 'cli',
-          accept: 'application/json',
-        },
-      }),
-    )
+    const res = await this.#fetchWithTimeout(url, {
+      headers: {
+        authorization: `Bearer ${ANONYMOUS_KEY}`,
+        'user-agent': opencodeUserAgent(),
+        'x-opencode-client': 'cli',
+        accept: 'application/json',
+      },
+    })
     if (!res.ok) throw new Error(`models endpoint HTTP ${res.status}`)
     const payload = (await res.json()) as { data?: Array<{ id?: unknown }> }
     const ids: string[] = []
@@ -272,7 +274,7 @@ export class ModelCatalog {
 
   async #refreshMetadata(): Promise<void> {
     try {
-      const res = await this.#withTimeout(this.#fetch(this.#opts.metadataUrl, { headers: { accept: 'application/json' } }))
+      const res = await this.#fetchWithTimeout(this.#opts.metadataUrl, { headers: { accept: 'application/json' } })
       if (!res.ok) throw new Error(`models.dev HTTP ${res.status}`)
       const prices = decodeModelsDev(await res.json())
       if (prices.size === 0) throw new Error('models.dev has no OpenCode metadata')
@@ -333,10 +335,15 @@ export class ModelCatalog {
   limits(model: string): { contextWindow?: number; maxOutput?: number } | undefined {
     const price = this.#prices.get(model)
     if (!price) return undefined
-    if (price.contextWindow === undefined && price.maxOutput === undefined) return undefined
+    // Overrides are resolved here, not at the S2 decode site, so the advertised
+    // limits are raised for every surface that reads limits() while the raw
+    // models.dev record (and everything keyed off cost) stays untouched.
+    const contextWindow = contextWindowOverrides[model] ?? price.contextWindow
+    const maxOutput = maxOutputOverride ?? price.maxOutput
+    if (contextWindow === undefined && maxOutput === undefined) return undefined
     return {
-      ...(price.contextWindow !== undefined ? { contextWindow: price.contextWindow } : {}),
-      ...(price.maxOutput !== undefined ? { maxOutput: price.maxOutput } : {}),
+      ...(contextWindow !== undefined ? { contextWindow } : {}),
+      ...(maxOutput !== undefined ? { maxOutput } : {}),
     }
   }
 
@@ -358,11 +365,20 @@ export class ModelCatalog {
     }
   }
 
-  async #withTimeout(promise: Promise<Response>, ms = FETCH_TIMEOUT_MS): Promise<Response> {
+  /**
+   * Fetch with a hard deadline.
+   *
+   * The abort signal has to ride along on the request that is actually issued.
+   * A timer wrapped around an already-created promise cannot cancel anything —
+   * `controller.abort()` fires into the void — so a source that hangs instead of
+   * failing fast (models.dev serves a ~6MB body) used to stall the entire refresh
+   * cycle indefinitely, and the abort timer was decoration.
+   */
+  async #fetchWithTimeout(url: string, init: RequestInit, ms = this.#fetchTimeoutMs): Promise<Response> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), ms)
     try {
-      return await promise
+      return await this.#fetch(url, { ...init, signal: controller.signal })
     } finally {
       clearTimeout(timer)
     }
