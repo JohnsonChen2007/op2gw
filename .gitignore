@@ -12,6 +12,7 @@ op2gw-*.tar.gz
 logs/
 *.tmp
 *.temp
+*.tmp.mjs
 
 # OS files
 .DS_Store
@@ -42,3 +43,10 @@ VERIFY-REPORT.md
 python-history/
 video/*.mp4
 video/build/audio/
+
+# WorkBuddy bridge snapshot — local-only artifacts
+workbuddy-bridge/**/node_modules/
+workbuddy-bridge/**/*.log
+workbuddy-bridge/**/.bridge-key
+workbuddy-bridge/**/config.json
+workbuddy-bridge/**/storage.sqlite

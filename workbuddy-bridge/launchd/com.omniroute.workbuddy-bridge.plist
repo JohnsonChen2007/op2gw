@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TEMPLATE — placeholders are substituted on the target machine:
+    __HOME__              the user's home directory
+    __BRIDGE_DIR__        directory holding bridge.mjs (default ~/.omniroute/workbuddy-bridge)
+    __PATH__              PATH for the launchd job
+  Render it with the op2gw helper:  node scripts/render-plist.mjs
+  or substitute the tokens by hand before `launchctl load`.
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>__PATH__</string>
+		<key>WB_BRIDGE_PORT</key>
+		<string>11459</string>
+		<key>WORKBUDDY_AI_ELECTRON_BIN</key>
+		<string>/Applications/WorkBuddy AI.app/Contents/MacOS/Electron</string>
+		<key>WORKBUDDY_ELECTRON_BIN</key>
+		<string>/Applications/WorkBuddy.app/Contents/MacOS/Electron</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.omniroute.workbuddy-bridge</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/node</string>
+		<string>__BRIDGE_DIR__/bridge.mjs</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>__BRIDGE_DIR__/bridge.err.log</string>
+	<key>StandardOutPath</key>
+	<string>__BRIDGE_DIR__/bridge.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>__BRIDGE_DIR__</string>
+</dict>
+</plist>

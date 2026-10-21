@@ -1,0 +1,239 @@
+--- a/bridge.mjs
++++ b/bridge.mjs
+@@ -14,8 +14,27 @@
+  */
+ import { createServer } from 'node:http';
+ import { readFileSync } from 'node:fs';
++import { homedir } from 'node:os';
++import { join } from 'node:path';
+ 
+-const PLUGIN_LIB = '__HOME__/dsh-workbuddy-connect/lib/index.js';
++// Default Electron binaries (decrypt the 5.6+ at-rest credential envelopes).
++// They must be set before the plugin module is imported: the plugin captures
++// its key provider at import time, and an unset AI binary makes every
++// workbuddy-ai credential read fail with "no WorkBuddy AI Electron binary is
++// configured". Both remain overridable via env, as the DSH plugin documents.
++const CN_ELECTRON_BIN = '/Applications/WorkBuddy.app/Contents/MacOS/Electron';
++const AI_ELECTRON_BIN = '/Applications/WorkBuddy AI.app/Contents/MacOS/Electron';
++if (!process.env['WORKBUDDY_ELECTRON_BIN']) {
++  process.env['WORKBUDDY_ELECTRON_BIN'] = CN_ELECTRON_BIN;
++}
++if (!process.env['WORKBUDDY_AI_ELECTRON_BIN']) {
++  process.env['WORKBUDDY_AI_ELECTRON_BIN'] = AI_ELECTRON_BIN;
++}
++
++// Where the dsh-workbuddy-connect plugin is installed on this machine.
++// Override with WB_PLUGIN_LIB when the checkout lives elsewhere.
++const PLUGIN_LIB = process.env['WB_PLUGIN_LIB']
++  || join(homedir(), 'dsh-workbuddy-connect', 'lib', 'index.js');
+ const {
+   WorkBuddyCredentialStore,
+   WorkBuddyUpstreamClient,
+@@ -28,17 +47,14 @@
+   regionOf,
+ } = await import(PLUGIN_LIB);
+ 
+-// Default Electron binary (decrypts the 5.6+ at-rest credential envelopes).
+-// Overridable via env, exactly like the DSH plugin documents.
+-if (!process.env['WORKBUDDY_ELECTRON_BIN']) {
+-  process.env['WORKBUDDY_ELECTRON_BIN'] = '/Applications/WorkBuddy.app/Contents/MacOS/Electron';
+-}
+-
+ const PORT = Number(process.env['WB_BRIDGE_PORT'] || '11459');
+ let API_KEY = (process.env['WB_BRIDGE_API_KEY'] || '').trim();
+ if (!API_KEY) {
+   try {
+-    API_KEY = readFileSync('__HOME__/.omniroute/workbuddy-bridge/.bridge-key', 'utf8').trim();
++    // Shared secret file, created by the restore steps in README.md.
++    const keyPath = process.env['WB_BRIDGE_KEY_FILE']
++      || join(homedir(), '.omniroute', 'workbuddy-bridge', '.bridge-key');
++    API_KEY = readFileSync(keyPath, 'utf8').trim();
+   } catch {}
+ }
+ if (!API_KEY) {
+@@ -50,13 +66,29 @@
+ const BODY_LIMIT = 64 * 1024 * 1024;
+ 
+ const client = new WorkBuddyUpstreamClient();
+-const variants = [
++const AUTH_FILE_ENV = {
++  [CN_VARIANT.id]: 'WB_WORKBUDDY_AUTH_FILE',
++  [AI_VARIANT.id]: 'WB_WORKBUDDY_AI_AUTH_FILE',
++};
++// WB_WORKBUDDY_VARIANT pins the whole bridge to one variant. Run a second
++// instance on another port when a client cannot send a variant header.
++const FORCED_VARIANT = (process.env['WB_WORKBUDDY_VARIANT'] || '').trim();
++const allVariants = [
+   { variant: CN_VARIANT, fallback: FALLBACK_WORKBUDDY_MODELS },
+   { variant: AI_VARIANT, fallback: FALLBACK_WORKBUDDY_AI_MODELS },
+ ];
++const variants = allVariants.filter(
++  (v) => FORCED_VARIANT === '' || FORCED_VARIANT === v.variant.id,
++);
++if (variants.length === 0) {
++  console.error(`[wb-bridge] WB_WORKBUDDY_VARIANT=${FORCED_VARIANT} matches no variant`);
++  process.exit(1);
++}
+ for (const v of variants) {
++  const desktopPath = (process.env[AUTH_FILE_ENV[v.variant.id]] || '').trim();
+   v.store = new WorkBuddyCredentialStore({
+     variant: v.variant,
++    ...(desktopPath ? { desktopPath } : {}),
+     refresh: (cred) => client.refreshToken(cred),
+   });
+   v.models = [...v.fallback];
+@@ -65,11 +97,35 @@
+   v.hasCredential = false;
+ }
+ 
+-function variantForModel(modelId) {
+-  for (const v of variants) {
+-    if (v.models.some((m) => m.id === modelId)) return v;
++/**
++ * Resolve the variant for a request.
++ *
++ * Both WorkBuddy products expose the *same* model ids, so the id alone cannot
++ * tell them apart. OmniRoute strips the `workbuddy/` / `workbuddy-ai/`
++ * prefix before forwarding, so a request that carries no variant hint would
++ * otherwise always land on the first variant whose catalog happens to contain
++ * the id (the CN one). That is how workbuddy-ai silently spent CN quota, and
++ * why a signed-out AI connection still reported `not signed in (WorkBuddy)`.
++ *
++ * Priority: explicit header -> model prefix -> catalog membership -> forced or
++ * first variant.
++ */
++function variantForRequest(modelId, hint) {
++  const wanted = (hint || '').trim().toLowerCase();
++  if (wanted !== '') {
++    const found = variants.find(
++      (v) => v.variant.id === wanted || v.variant.displayName.toLowerCase() === wanted,
++    );
++    if (found) return found;
+   }
+-  return variants[0];
++  const byPrefix = /^(workbuddy-ai|workbuddy)\/(.+)$/i.exec(modelId || '');
++  if (byPrefix) {
++    const id = byPrefix[1].toLowerCase();
++    const found = variants.find((v) => v.variant.id === id);
++    if (found) return found;
++  }
++  const byCatalog = variants.find((v) => v.models.some((m) => m.id === modelId));
++  return byCatalog ?? variants[0];
+ }
+ 
+ async function refreshCatalog(v, force = false) {
+@@ -107,6 +163,35 @@
+   for (const v of variants) await refreshCatalog(v, force);
+ }
+ 
++async function variantSnapshot(v) {
++  let status;
++  try {
++    status = await v.store.status();
++  } catch (e) {
++    status = { state: 'error', reason: String(e).slice(0, 300) };
++  }
++  return {
++    id: v.variant.id,
++    app: v.variant.appName,
++    region: v.variant.region,
++    signedIn: status.state === 'signed-in',
++    status,
++    models: v.models.length,
++    catalogLive: v.live,
++    desktopAuthPath: v.store.desktopAuthPath(),
++    pluginCopyPath: v.store.ownAuthPath(),
++  };
++}
++
++async function statusSnapshot() {
++  return {
++    ok: true,
++    models: allModels().length,
++    forcedVariant: FORCED_VARIANT || null,
++    variants: await Promise.all(variants.map(variantSnapshot)),
++  };
++}
++
+ function allModels() {
+   const seen = new Set();
+   const out = [];
+@@ -276,17 +361,27 @@
+     sendOpenAIError(res, 400, 'invalid JSON body', 'invalid_request_error');
+     return;
+   }
+-  const modelId = body.model;
+-  if (typeof modelId !== 'string' || !modelId) {
++  const requestedModel = body.model;
++  if (typeof requestedModel !== 'string' || !requestedModel) {
+     sendOpenAIError(res, 400, 'missing model', 'invalid_request_error');
+     return;
+   }
+-  const v = variantForModel(modelId);
++  const hint = req.headers['x-workbuddy-variant'] || req.headers['x-op2gw-variant'];
++  const v = variantForRequest(requestedModel, typeof hint === 'string' ? hint : '');
++  const modelId = requestedModel.replace(/^(?:workbuddy-ai|workbuddy)\//i, '');
++  body.model = modelId;
+   let credential;
+   try {
+     credential = await v.store.resolve();
+   } catch (e) {
+-    sendOpenAIError(res, 401, `not signed in (${v.variant.displayName}): ${String(e).slice(0, 200)}`, 'unauthorized');
++    const detail = String(e).slice(0, 300);
++    console.warn(`[wb-bridge] ${v.variant.id} request refused: ${detail}`);
++    sendOpenAIError(
++      res,
++      401,
++      `${v.variant.id} is signed out: ${detail}. Sign in once in ${v.variant.appName ?? v.variant.displayName} and retry.`,
++      'unauthorized',
++    );
+     return;
+   }
+   sanitizeBodyForChannel(body);
+@@ -343,22 +438,43 @@
+   try {
+     const url = req.url ?? '/';
+     if (req.method === 'GET' && (url === '/healthz' || url === '/healthz/')) {
+-      sendJson(res, 200, { ok: true, models: allModels().length });
++      const snap = await statusSnapshot();
++      sendJson(res, 200, {
++        ok: true,
++        models: snap.models,
++        variants: snap.variants.map((v) => ({ id: v.id, signedIn: v.signedIn, models: v.models })),
++      });
+       return;
+     }
+     if (!checkAuth(req)) {
+       sendOpenAIError(res, 401, 'missing or invalid Authorization bearer', 'unauthorized');
+       return;
+     }
++    if (req.method === 'GET' && (url === '/v1/status' || url === '/v1/status/')) {
++      sendJson(res, 200, await statusSnapshot());
++      return;
++    }
+     if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) {
+       await refreshAll(false);
++      // A client that reaches this bridge through a per-provider node (OmniRoute
++      // sends `x-workbuddy-variant`, see providerSpecificData.customHeaders) must
++      // get only that variant's catalog. Without the hint the merged list stays
++      // the historical behavior, so a single flat client is unaffected.
++      const hintHeader = req.headers['x-workbuddy-variant'] || req.headers['x-op2gw-variant'];
++      const hint = typeof hintHeader === 'string' ? hintHeader.trim().toLowerCase() : '';
++      const scoped = hint
++        ? variants.find(
++            (v) => v.variant.id.toLowerCase() === hint || v.variant.displayName.toLowerCase() === hint,
++          )
++        : undefined;
++      const models = scoped ? scoped.models : allModels();
+       sendJson(res, 200, {
+         object: 'list',
+-        data: allModels().map((m) => ({
++        data: models.map((m) => ({
+           id: m.id,
+           object: 'model',
+           created: 0,
+-          owned_by: 'workbuddy',
++          owned_by: scoped ? scoped.variant.id : 'workbuddy',
+         })),
+       });
+       return;

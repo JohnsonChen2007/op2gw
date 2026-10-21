@@ -1,0 +1,32 @@
+diff --git a/src/upstream.ts b/src/upstream.ts
+index 9daf3fd..6272dc3 100644
+--- a/src/upstream.ts
++++ b/src/upstream.ts
+@@ -7,6 +7,8 @@
+  * @module dsh-workbuddy-connect/upstream
+  */
+ 
++import { randomUUID } from 'node:crypto'
++
+ import { appUserAgent, resolveAppVersion, type AppVersionInfo } from './app-version.ts'
+ import { chatUserAgent, fallbackChatIdentity, resolveChatIdentity, type ChatIdentity } from './client-identity.ts'
+ import type { WorkBuddyCredential } from './auth.ts'
+@@ -404,6 +406,18 @@ function chatHeaders(credential: WorkBuddyCredential, userAgent: string, clientV
+     'X-IDE-Version': clientVersion,
+     'X-Product': 'SaaS',
+   }
++  // The international gateway (www.workbuddy.ai) runs a channel check that
++  // rejects chat requests without the desktop client's conversation headers
++  // (HTTP 400 / code 11128 "request illegal"). The CN endpoint accepts them
++  // too, but we only add them for `global` so the CN wire stays byte-identical
++  // to what has been measured against www.workbuddy.cn.
++  if (regionOf(credential.domain) === 'global') {
++    headers['X-Agent-Intent'] = 'craft'
++    headers['X-Conversation-Id'] = randomUUID()
++    headers['X-Conversation-Request-ID'] = randomUUID()
++    headers['X-Conversation-Message-ID'] = randomUUID()
++    headers['X-Request-ID'] = randomUUID()
++  }
+   return headers
+ }
+ 

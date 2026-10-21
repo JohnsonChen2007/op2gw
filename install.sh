@@ -68,7 +68,20 @@ info "编译 TypeScript…"
 npm run build >/dev/null 2>&1 || die "编译失败，请运行 'npm run build' 查看详细错误。"
 ok "编译完成 (dist/)"
 
-# --- 5. done / start ---
+# --- 5. launchd agents (macOS only, opt-out) ---
+# The tracked scripts/*.plist are TEMPLATES carrying __PLACEHOLDER__ tokens, so
+# the repo never records a real home directory. Render them here, on the machine
+# that actually installs.
+if [[ "${OP2GW_SKIP_LAUNCHD:-0}" != "1" && "$(uname -s)" == "Darwin" ]]; then
+  info "渲染 launchd 任务…"
+  if node scripts/render-plist.mjs; then
+    ok "launchd 任务已生成 (~/Library/LaunchAgents)"
+  else
+    warn "launchd 任务生成失败，可手动运行 'node scripts/render-plist.mjs'。"
+  fi
+fi
+
+# --- 6. done / start ---
 PORT="8787"
 for ((i=0; i<${#EXTRA_ARGS[@]}; i++)); do
   if [[ "${EXTRA_ARGS[$i]}" == "--port" ]]; then PORT="${EXTRA_ARGS[$((i+1))]:-8787}"; fi

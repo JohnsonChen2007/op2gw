@@ -1,0 +1,57 @@
+name: diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: Commit or branch to check (record resolved SHA)
+        required: true
+        default: dfb17949cbf9ba5d93ac41c76cbe436a3a331d07
+        type: string
+permissions:
+  contents: read
+jobs:
+  check:
+    name: diagnostics (${{ matrix.os }}, Node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-2022, windows-2025]
+        node: [22]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_ref }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - name: record environment
+        run: |
+          mkdir -p ci-logs
+          git rev-parse HEAD > ci-logs/commit.txt
+          node -e 'const os = require("node:os"); console.log(JSON.stringify({platform: process.platform, arch: process.arch, release: os.release(), version: os.version(), node: process.version}, null, 2))' > ci-logs/environment.json
+          pnpm --version > ci-logs/pnpm-version.txt
+      - name: install dependencies
+        run: |
+          set -o pipefail
+          pnpm install --frozen-lockfile 2>&1 | tee ci-logs/install.log
+      - name: check
+        run: |
+          set -o pipefail
+          pnpm run check 2>&1 | tee ci-logs/check.log
+      - name: upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-log-${{ matrix.os }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 14

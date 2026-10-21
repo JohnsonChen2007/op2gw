@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "skipLibCheck": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "es2024",
+    "lib": ["es2024"],
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "include": ["src", "tests"],
+  "exclude": ["src/client", "tests/probe-composer.spec.ts", "tests/plugin-card.spec.ts", "tests/client-variants.spec.ts", "tests/slot-registration.spec.ts", "tests/client-defects.spec.ts", "tests/client-fallback.spec.ts", "tests/model-visibility-card.spec.ts", "tests/electron-assist.spec.ts", "tests/update-notice.spec.ts"]
+}

@@ -8,13 +8,13 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/esadmin/src/opencode2gw/op2gw/scripts/watchdog.sh</string>
+        <string>__OP2GW_ROOT__/scripts/watchdog.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/esadmin/.nvm/versions/node/v24.15.0/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>__PATH__</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -25,8 +25,8 @@
     <string>Background</string>
 
     <key>StandardOutPath</key>
-    <string>/Users/esadmin/src/opencode2gw/op2gw/logs/watchdog.log</string>
+    <string>__OP2GW_ROOT__/logs/watchdog.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/esadmin/src/opencode2gw/op2gw/logs/watchdog.log</string>
+    <string>__OP2GW_ROOT__/logs/watchdog.log</string>
 </dict>
 </plist>
