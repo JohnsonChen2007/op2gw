@@ -64,6 +64,18 @@ export interface ExitView extends ExitNode {
   cooldownRemainingMs: number
 }
 
+/**
+ * How much remaining cool-down a starved pool is willing to ignore rather than
+ * refuse the request. A short cool-down is precautionary — one blip raises it —
+ * so by the time the pool is starved, sampling the least-cooled exit either
+ * succeeds or returns a real 429 the client can act on, both strictly better
+ * than a flat 503 with no upstream answer. Long quota cool-downs stay excluded:
+ * they are a guaranteed 429 plus the connect-timeout tax on top, and waiting
+ * them out inside one request would mean tens of seconds of rotation for
+ * nothing.
+ */
+const STARVED_COOLDOWN_BUDGET_MS = 120_000
+
 const DIRECT: ExitNode = {
   id: 'direct',
   kind: 'direct',
@@ -194,6 +206,13 @@ export class ExitPool {
     const health = this.#health.get(exitId)
     if (!node || !health) return false
     if (health.state === 'dead') return false
+    // A FREE exit earns rotation slots only once a probe has proved it can carry
+    // traffic. Fresh admissions sit in 'unknown' — sending real requests through
+    // them before verification is what cost a full 10s connect timeout on every
+    // unlucky pick (measured 2026-10-21: 1-3s completions stretched to 20-80s).
+    // Manual exits keep the old behaviour: they are hand-configured, so 'unknown'
+    // there only means "not re-verified since boot".
+    if (health.state === 'unknown' && node.source === 'free') return false
     if (health.cooldownUntil > this.#now()) return false
     const ban = this.#bans.get(this.#banKey(exitId, model))
     if (ban && this.#banActive(ban)) return false
@@ -250,8 +269,38 @@ export class ExitPool {
         if (exclude && exclude.has(n.id)) return false
         if (!this.#eligible(n.id)) return false
         const health = this.#health.get(n.id)
-        return health && health.state !== 'dead' && health.cooldownUntil <= this.#now()
+        if (!health || health.state === 'dead') return false
+        // Same gate as isUsable: a free exit that has never been probed must not
+        // become the emergency candidate either — that would reintroduce the
+        // connect-timeout tax precisely when the pool is already starved.
+        if (health.state === 'unknown' && n.source === 'free') return false
+        return health.cooldownUntil <= this.#now()
       })
+    }
+    if (candidates.length === 0) {
+      // Cool-down relief: the tier above only reaches exits that are NOT cooling,
+      // so a pool where every exit is inside a cool-down used to return null and
+      // the client got a flat refusal. Sample the short-cooled exits instead
+      // (STARVED_COOLDOWN_BUDGET_MS) — a refusal is the one outcome that carries
+      // no upstream information, and the round-robin below keeps even a starved
+      // pool's attempts spread across IPs rather than piled on one.
+      const now = this.#now()
+      const soon = [...this.#exits.values()].filter((n) => {
+        if (exclude && exclude.has(n.id)) return false
+        if (!this.#eligible(n.id)) return false
+        const health = this.#health.get(n.id)
+        if (!health || health.state === 'dead') return false
+        if (health.state === 'unknown' && n.source === 'free') return false
+        const remaining = health.cooldownUntil - now
+        if (remaining <= 0 || remaining > STARVED_COOLDOWN_BUDGET_MS) return false
+        // An identity-gate verdict for this exit×model does not expire on its
+        // own clock — that class is what the model-ban relief above relieves.
+        const ban = this.#bans.get(this.#banKey(n.id, model))
+        if (ban && this.#banActive(ban)) return false
+        return true
+      })
+      soon.sort((a, b) => this.#health.get(a.id)!.cooldownUntil - this.#health.get(b.id)!.cooldownUntil)
+      candidates = soon
     }
     if (candidates.length === 0) return null
     candidates.sort((a, b) => {

@@ -37,7 +37,13 @@ export class DispatcherCache {
   constructor(options: DispatcherCacheOptions & { defaultProxy?: string } = {}) {
     this.#cap = options.cap ?? 64
     this.#opts = {
-      connectTimeoutMs: options.connectTimeoutMs ?? 10_000,
+      // 6s, not the undici-ish 10s: this is what a flaky EXIT costs the request
+      // that lands on it before the rotate loop can move on (measured
+      // 2026-10-21 — free-list proxies were stalling completions for a full 10s).
+      // The hand-configured exits measure 0.7-1.5s, so 6s still leaves 4x
+      // headroom, and the probe's own 6s per-target abort already treats anything
+      // slower as unreachable — the two budgets agree by construction.
+      connectTimeoutMs: options.connectTimeoutMs ?? 6_000,
       // headersTimeout covers time-to-response-headers only; the gateway owns
       // the body-idle watchdog separately (like opencode2dsh learned).
       headersTimeoutMs: options.headersTimeoutMs ?? 60_000,

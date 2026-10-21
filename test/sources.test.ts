@@ -76,9 +76,11 @@ test('FreeSources parses, dedupes, and respects the limit', async () => {
   const sources = new FreeSources(['http://list.example/p'], silentLogger(), { fetchImpl })
   const out = await sources.fetchAll(10)
   assert.deepEqual(seenUrls, ['http://list.example/p'])
+  // Candidate order is deliberately sampled (see shuffle in fetchAll) so each
+  // cycle reads a different slice of the list — membership is what is contractual.
   assert.deepEqual(
-    out.map((e) => e.id),
-    ['http://a:1', 'socks5://b:2', 'http://d:4'],
+    out.map((e) => e.id).sort(),
+    ['http://a:1', 'http://d:4', 'socks5://b:2'],
     'comments, blanks, socks4, junk, and duplicates are dropped',
   )
   assert.equal(sources.states()[0]?.yielded, 3)

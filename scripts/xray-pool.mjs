@@ -35,14 +35,27 @@ const DEFAULT_XRAY = join(homedir(), 'Library/Application Support/v2rayN/bin/xra
 const DEFAULT_OUT_DIR = join(homedir(), '.op2gw/xray-pool')
 
 /** Cloudflare edge ranges: nodes addressed here are worker/pages frontends
- *  whose egress is Cloudflare's shared pool — many nodes, few real IPs. */
+ *  whose egress is Cloudflare's shared pool — many nodes, few real IPs.
+ *
+ *  The three groups below are all the same failure: a "CF官方优选" anycast address
+ *  and its worker siblings front ONE origin behind them, so N of these slots buy
+ *  N times the prober load and exactly one free-lane quota. Measured 2026-10-21
+ *  while rotating: 188.164.248.43 + 8.39.125.242 + 91.193.58.222 + two more all
+ *  exited at 162.4.173.74, and the 188.164.248.9 / 8.39.125.70 / 8.35.211.19 trio
+ *  all exited at 128.1.186.114 — while several of them timed out entirely. */
 const CF_PREFIXES = [
   '104.16.', '104.17.', '104.18.', '104.19.', '104.20.', '104.21.', '104.22.', '104.23.',
   '104.24.', '104.25.', '104.26.', '104.27.', '104.28.',
   '108.162.', '141.101.', '162.158.', '162.159.', '172.64.', '172.65.', '172.66.', '172.67.',
   '172.68.', '172.69.', '172.70.', '172.71.', '173.245.', '188.114.', '190.93.', '197.234.',
   '198.41.', '103.21.244.', '103.22.200.', '103.31.4.', '5.101.78.',
+  // "CF官方优选" anycast front ends (empirically shared egress — see above).
+  '91.193.', '188.164.', '8.35.', '8.39.', '162.4.', '64.16.', '64.68.',
 ]
+
+/** Remarks-level CF detection: the anycast ranges above move, but this library
+ *  labels those nodes in the remark too ("CF官方优选19", "01-vless-worker-…"). */
+const CF_REMARK_RE = /\b(cf|cloudflare|worker)\b/i
 
 function parseArgs(argv) {
   const args = { _: [] }
@@ -159,11 +172,19 @@ function selectNodes(db, guiCfg, count, onlyAddresses, excludeAddresses) {
   }
 
   const deduped = dedupeByAddress(rows)
-  const direct = deduped.filter((r) => isIp(r.address) && !isCf(r.address))
-  const workers = deduped.filter((r) => !isIp(r.address) || isCf(r.address))
+  // A slot is only worth taking if it carries its OWN free-lane quota, i.e. its
+  // own egress IP. Cloudflare-fronted nodes and worker frontends fail that test
+  // (see CF_PREFIXES): they are kept out entirely rather than "one per backend",
+  // because one backend = one IP = one quota regardless of how many edges cover
+  // it — and picking them is what let a rotation silently shrink the pool to a
+  // single shared exit IP (observed 2026-10-21). A short pool of genuinely
+  // distinct exits beats a long pool of aliases for the same IP.
+  const shared = (r) => !isIp(r.address) || isCf(r.address) || CF_REMARK_RE.test(r.remarks || '')
+  const direct = deduped.filter((r) => !shared(r))
+  const workers = deduped.filter(shared)
 
-  // Direct-IP nodes first, spread across /16 prefixes so a provider that owns a
-  // contiguous block does not fill the whole pool; one worker per backend after.
+  // Direct-IP nodes only, spread across /16 prefixes so a provider that owns a
+  // contiguous block does not fill the whole pool.
   const byPrefix = new Map()
   for (const r of direct) {
     const p = r.address.split('.').slice(0, 2).join('.')
@@ -179,16 +200,13 @@ function selectNodes(db, guiCfg, count, onlyAddresses, excludeAddresses) {
     }
   }
 
-  const seenBackend = new Set()
-  const workerPicks = []
-  for (const r of workers) {
-    const k = backendKey(r)
-    if (seenBackend.has(k)) continue
-    seenBackend.add(k)
-    workerPicks.push(r)
+  let picked = spread
+  if (workers.length && !picked.length) {
+    // Nothing distinct available: say so instead of emitting a pool of aliases.
+    process.stderr.write(
+      `xray-pool: only shared-egress nodes available (${workers.length} CF/worker) — refusing to generate slots that buy no distinct egress IP\n`,
+    )
   }
-
-  let picked = [...spread, ...workerPicks]
   if (onlyAddresses) {
     const allow = new Set(onlyAddresses.split(',').map((s) => s.trim()).filter(Boolean))
     picked = picked.filter((r) => allow.has(r.address))
@@ -262,6 +280,17 @@ const nodes = selectNodes(
 )
 if (nodes.length === 0) {
   console.error('xray-pool: no usable nodes found in the v2rayN database')
+  process.exit(1)
+}
+// Partial pools are refused rather than written: the op2gw side references
+// every port in base-port..base-port+count-1, so a shorter sidecar would leave
+// the remaining entries as dead pool members — a rotation that quietly trades
+// N real exits for a handful of dead ones. Failing leaves the working config in
+// place and lets the caller fall back to a gateway restart instead.
+if (nodes.length < count) {
+  console.error(
+    `xray-pool: only ${nodes.length}/${count} distinct-egress nodes available — keeping the existing sidecar rather than generating a partial pool`,
+  )
   process.exit(1)
 }
 

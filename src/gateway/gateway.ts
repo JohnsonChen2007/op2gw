@@ -21,6 +21,12 @@ import {
   responsesToChatStream,
   stripCallerBoundReasoning,
 } from './protocol.js'
+import {
+  buildToolSchemas,
+  normalizeClientCompletion,
+  normalizeClientStream,
+  type ToolSchemas,
+} from './tool-args.js'
 
 /** Ceiling for any single rotation backoff (Retry-After included). */
 const MAX_BACKOFF_MS = 4_000
@@ -161,6 +167,7 @@ export class Gateway {
 
     // Force wire streaming (the free lane requires it) and inject gate tools.
     let wireBody = this.#prepareBody(wireApi, req.api, { ...req.body, stream: true })
+    const toolSchemas = buildToolSchemas(req.body)
 
     // Rotate budget: on a 429 (or other exit-shaped failure) we want to keep
     // hopping to a *different* IP until we run out of usable exits. So the
@@ -250,7 +257,7 @@ export class Gateway {
           if (wireApi === 'chat') {
             result.body = wrapInstantLengthGuard(result.body, this.#lengthGuardOptions(model))
           }
-          body = this.#toClientStream(req.api, wireApi, result.body, model)
+          body = this.#toClientStream(req.api, wireApi, result.body, model, toolSchemas)
         } else {
           // Aggregation throws an UpstreamError on an in-body error, so a
           // non-streaming client gets a real status code and a retry instead of
@@ -263,7 +270,7 @@ export class Gateway {
               throwOnConvert: true,
             })
           }
-          body = await this.#toClientCompletion(req.api, wireApi, result.rawBody, model)
+          body = await this.#toClientCompletion(req.api, wireApi, result.rawBody, model, toolSchemas)
         }
 
         this.#d.pool.markSuccess(exit.id, model)
@@ -531,9 +538,20 @@ export class Gateway {
   }
 
   /** Wire SSE stream -> client dialect (identity when both dialects match). */
-  #toClientStream(clientApi: UpstreamApi, wireApi: UpstreamApi, source: Readable, model: string): Readable {
-    if (clientApi === wireApi) return source
-    return wireApi === 'responses' ? responsesToChatStream(source, model) : chatToResponsesStream(source, model)
+  #toClientStream(
+    clientApi: UpstreamApi,
+    wireApi: UpstreamApi,
+    source: Readable,
+    model: string,
+    toolSchemas: ToolSchemas,
+  ): Readable {
+    const translated =
+      clientApi === wireApi
+        ? source
+        : wireApi === 'responses'
+          ? responsesToChatStream(source, model)
+          : chatToResponsesStream(source, model)
+    return normalizeClientStream(clientApi, translated, toolSchemas)
   }
 
   /** Guard options shared by the streaming and aggregating chat-wire paths. */
@@ -557,12 +575,16 @@ export class Gateway {
     wireApi: UpstreamApi,
     source: Readable,
     model: string,
+    toolSchemas: ToolSchemas,
   ): Promise<Readable> {
     try {
-      if (clientApi === wireApi) return await aggregateSse({ body: source } as UpstreamResult, wireApi)
-      return await (wireApi === 'responses'
-        ? responsesToChatCompletion(source, model)
-        : chatToResponsesCompletion(source, model))
+      const body =
+        clientApi === wireApi
+          ? await aggregateSse({ body: source } as UpstreamResult, wireApi)
+          : await (wireApi === 'responses'
+              ? responsesToChatCompletion(source, model)
+              : chatToResponsesCompletion(source, model))
+      return await normalizeClientCompletion(clientApi, body, toolSchemas)
     } catch (err) {
       // Converters throw plain Errors; hand the rotation loop a classified
       // UpstreamError so an in-body failure rotates like any other exit-shaped

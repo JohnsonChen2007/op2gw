@@ -47,6 +47,50 @@ test('chat -> responses moves the system prompt into instructions', () => {
   assert.deepEqual(out.input, [{ role: 'user', content: 'hi' }])
 })
 
+test('chat -> responses normalizes Bash command aliases and empty arguments safely', () => {
+  const aliased = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call_alias', type: 'function', function: { name: 'bash', arguments: '{"cmd":"printf alias"}' } }] },
+    ],
+  })
+  assert.equal((aliased.input as Array<Record<string, unknown>>)[0]?.arguments, '{"command":"printf alias"}')
+
+  const empty = chatToResponsesBody({
+    model: 'muse-spark-1.3-contributor-free',
+    messages: [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'call_empty', type: 'function', function: { name: 'Bash', arguments: '{}' } }] },
+    ],
+  })
+  assert.equal(
+    (empty.input as Array<Record<string, unknown>>)[0]?.arguments,
+    JSON.stringify({ command: "printf '%s\\n' 'The Bash tool call had empty arguments; please retry with a command.'" }),
+  )
+})
+
+test('responses -> chat normalizes Bash command aliases and empty arguments safely', () => {
+  const aliased = responsesToChatBody({
+    model: 'big-pickle',
+    input: [{ type: 'function_call', call_id: 'call_alias', name: 'bash', arguments: '{"shell_command":"printf alias"}' }],
+  })
+  const aliasCall = ((aliased.messages as Array<Record<string, unknown>>)[0]?.tool_calls as Array<Record<string, unknown>>)[0]
+  assert.deepEqual(aliasCall, {
+    id: 'call_alias',
+    type: 'function',
+    function: { name: 'bash', arguments: JSON.stringify({ command: 'printf alias' }) },
+  })
+
+  const empty = responsesToChatBody({
+    model: 'big-pickle',
+    input: [{ type: 'function_call', call_id: 'call_empty', name: 'Bash', arguments: '{}' }],
+  })
+  const call = ((empty.messages as Array<Record<string, unknown>>)[0]?.tool_calls as Array<Record<string, unknown>>)[0]
+  assert.equal(
+    (call.function as Record<string, unknown>).arguments,
+    JSON.stringify({ command: "printf '%s\\n' 'The Bash tool call had empty arguments; please retry with a command.'" }),
+  )
+})
+
 test('chat -> responses converts a tool result into function_call_output', () => {
   const out = chatToResponsesBody({
     model: 'muse-spark-1.3-contributor-free',
@@ -59,7 +103,7 @@ test('chat -> responses converts a tool result into function_call_output', () =>
   })
   const input = out.input as Array<Record<string, unknown>>
   assert.deepEqual(input[0], { role: 'user', content: 'list files' })
-  assert.deepEqual(input[1], { type: 'function_call', call_id: 'call_1', name: 'bash', arguments: '{"cmd":"ls"}' })
+  assert.deepEqual(input[1], { type: 'function_call', call_id: 'call_1', name: 'bash', arguments: JSON.stringify({ command: 'ls' }) })
   assert.deepEqual(input[2], { type: 'function_call_output', call_id: 'call_1', output: 'a.txt' })
   for (const item of input) {
     assert.notEqual(item.role, 'tool', 'a tool result is not a message role in this dialect')

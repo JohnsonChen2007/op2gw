@@ -273,7 +273,10 @@ export function chatToResponsesBody(body: Json): Json {
           type: 'function_call',
           call_id: callId,
           name: String(fn.name ?? ''),
-          arguments: typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? ''),
+          arguments: normalizeBashToolArguments(
+            String(fn.name ?? ''),
+            typeof fn.arguments === 'string' ? fn.arguments : JSON.stringify(fn.arguments ?? {}),
+          ),
         })
       }
       continue
@@ -335,7 +338,10 @@ export function responsesToChatBody(body: Json): Json {
           {
             id: String(item.call_id ?? item.id ?? 'call_0'),
             type: 'function',
-            function: { name: String(item.name ?? ''), arguments: String(item.arguments ?? '') },
+            function: {
+              name: String(item.name ?? ''),
+              arguments: normalizeBashToolArguments(String(item.name ?? ''), String(item.arguments ?? '')),
+            },
           },
         ],
       })
@@ -648,6 +654,37 @@ function newChatCtx(model: string): ChatCtx {
   }
 }
 
+/**
+ * Keep clients with stricter Bash schemas usable when an upstream model emits
+ * a near-miss tool payload. We can safely rename common command fields, but an
+ * actually empty Bash call has no command to infer. Use a harmless command
+ * that reports the malformed call so the model gets a tool result and can
+ * retry, instead of leaving the client stuck at `command required`.
+ */
+function normalizeBashToolArguments(name: string, raw: string): string {
+  if (name.toLowerCase() !== 'bash') return raw
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw || '{}')
+  } catch {
+    return raw
+  }
+  if (!isRecord(parsed)) return raw
+  if (typeof parsed.command === 'string' && parsed.command.length > 0) return JSON.stringify(parsed)
+  for (const alias of ['cmd', 'command_line', 'shell_command']) {
+    if (typeof parsed[alias] === 'string' && parsed[alias].length > 0) {
+      const { [alias]: command, ...rest } = parsed
+      return JSON.stringify({ command, ...rest })
+    }
+  }
+  if (Object.keys(parsed).length === 0) {
+    return JSON.stringify({
+      command: "printf '%s\\n' 'The Bash tool call had empty arguments; please retry with a command.'",
+    })
+  }
+  return raw
+}
+
 function ensureRole(ctx: ChatCtx): string[] {
   if (ctx.roleSent) return []
   ctx.roleSent = true
@@ -767,7 +804,15 @@ function responsesEventToChat(ctx: ChatCtx, evt: Json): string[] {
       out.push(...ensureRole(ctx))
       out.push(
         chatChunk(ctx, {
-          tool_calls: [{ index, id: call.id, type: 'function', function: { name: call.name, arguments: pending } }],
+          tool_calls: [{
+            index,
+            id: call.id,
+            type: 'function',
+            function: {
+              name: call.name,
+              arguments: normalizeBashToolArguments(call.name ?? '', pending),
+            },
+          }],
         }, null),
       )
     }
@@ -918,7 +963,10 @@ export async function responsesToChatCompletion(source: Readable, model: string)
       index,
       id: call.id ?? `call_${index}`,
       type: 'function',
-      function: { name: call.name ?? '', arguments: call.args },
+      function: {
+        name: call.name ?? '',
+        arguments: normalizeBashToolArguments(call.name ?? '', call.args),
+      },
     }))
   } else {
     message.content = ctx.text

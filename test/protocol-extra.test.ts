@@ -197,7 +197,7 @@ test('responsesToChatBody maps function_call items into assistant tool_calls', (
   }) as { messages: Array<{ role: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> }> }
   assert.equal(out.messages[0]?.role, 'assistant')
   assert.equal(out.messages[0]?.tool_calls?.[0]?.function.name, 'bash')
-  assert.equal(out.messages[0]?.tool_calls?.[0]?.function.arguments, '{"cmd":"ls"}')
+  assert.equal(out.messages[0]?.tool_calls?.[0]?.function.arguments, JSON.stringify({ command: 'ls' }))
   assert.equal(out.messages[0]?.tool_calls?.[0]?.id, 'call_3')
 })
 

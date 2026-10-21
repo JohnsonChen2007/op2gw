@@ -22,6 +22,7 @@
     "test:coverage": "node --experimental-strip-types --experimental-test-coverage --test \"test/*.test.ts\"",
     "test:500": "node test-500.mjs",
     "pack:source": "node scripts/pack-source.mjs",
+    "sync-clients": "node scripts/sync-clients.mjs",
     "ci": "npm run typecheck && npm test"
   },
   "keywords": [

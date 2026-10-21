@@ -160,8 +160,19 @@ test('Runtime with includeDirect: false excludes direct from pool and routes str
     assert.equal(rt.pool.view()[0]?.id, 'http://proxy.example:8080')
     assert.equal(rt.pool.pick('m', 'sess')?.exit.id, 'http://proxy.example:8080')
 
-    // If manual proxy fails, it does NOT fall back to direct
+    // A short cool-down is relieved by the starved pool — and what it offers is
+    // still the PROXY, never the machine's own egress (direct is not in the pool
+    // at all with includeDirect: false, and #eligible would refuse it regardless).
     rt.pool.markFailure('http://proxy.example:8080', 'm', 'transport')
+    assert.equal(
+      rt.pool.pick('m', 'sess')?.exit.id,
+      'http://proxy.example:8080',
+      'starved relief keeps the pick on the proxy, never on direct',
+    )
+
+    // Once the exit is actually dead there is nothing left to offer: no fallback
+    // to direct, so the gateway refuses.
+    rt.pool.markProbe('http://proxy.example:8080', false, 0)
     assert.equal(rt.pool.pick('m', 'sess'), null, 'no fallback to direct when proxy-only')
 
     // Gateway handle refuses direct egress with 503

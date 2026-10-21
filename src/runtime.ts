@@ -41,6 +41,24 @@ const VERSION = '0.2.1'
 /** Floor between two recovery-triggered free-source fetches. */
 const RECOVER_REFRESH_MIN_INTERVAL_MS = 60_000
 
+/**
+ * How long a free exit that died after admission stays out of the candidate
+ * stream. Long enough to cover a whole outage window for that proxy, short
+ * enough that a proxy which recovers is eventually given a fair re-test.
+ */
+const FREE_REJECT_TTL_MS = 6 * 60 * 60_000
+
+/**
+ * Probe-latency budget for a FREE exit to be worth keeping. Aligned with the
+ * probe's own 6s per-target abort rather than the manual exits' sub-2s norm:
+ * a free proxy is allowed to be slow (that is the trade for an extra egress IP),
+ * but not so slow that every request routed to it stalls — the request path is
+ * bounded by the 6s connect timeout, so this budget is what decides whether a
+ * slot is worth the rotation it will occupy. Manual exits are exempt: they are
+ * the pool's proven capacity, not a lottery.
+ */
+const FREE_LATENCY_BUDGET_MS = 5_000
+
 export class Runtime {
   readonly config: Op2gwConfig
   readonly logger: Logger
@@ -55,6 +73,10 @@ export class Runtime {
   #startedAt = 0
   /** Throttles the free-source fetch fired by an on-demand recovery. */
   #lastRecoverRefresh = 0
+  /** Free ids currently admitted — an id that disappears has been evicted. */
+  readonly #freeAdmitted = new Set<string>()
+  /** Evicted free ids -> when, so a stable source file cannot cycle them back. */
+  readonly #freeRejected = new Map<string, number>()
 
   constructor(config: Op2gwConfig) {
     this.config = config
@@ -385,17 +407,47 @@ export class Runtime {
   /** Fetch free sources and admit new candidates up to the target size. */
   async refreshFreePool(): Promise<void> {
     if (!this.#sources) return
-    const current = this.pool.view().filter((e) => e.source === 'free').length
-    const need = Math.max(0, this.config.pool.freeTargetSize - current)
+    const now = Date.now()
+    // Retire what died: an id we admitted that is no longer in the pool was
+    // evicted as dead, and these lists are stable enough in order that the next
+    // fetch would hand back exactly that same address.
+    for (const [id, at] of this.#freeRejected) if (now - at > FREE_REJECT_TTL_MS) this.#freeRejected.delete(id)
+    for (const id of [...this.#freeAdmitted]) {
+      if (this.pool.has(id)) continue
+      this.#freeAdmitted.delete(id)
+      this.#freeRejected.set(id, now)
+    }
+
+    // Retire free exits that probe alive but too slow to keep (see
+    // FREE_LATENCY_BUDGET_MS): they count as "live" and so hold a slot at the
+    // target while costing every request that lands on them a full connect
+    // timeout. They also go into the rejection set, so the next fetch brings a
+    // different address rather than this one back.
+    for (const exit of this.pool.view()) {
+      if (exit.source !== 'free' || exit.state !== 'ok') continue
+      if (exit.latencyMs <= FREE_LATENCY_BUDGET_MS) continue
+      this.pool.remove(exit.id)
+      this.#freeAdmitted.delete(exit.id)
+      this.#freeRejected.set(exit.id, now)
+      this.logger.child('pool').info('dropped slow free exit', { uri: exit.id, latencyMs: exit.latencyMs })
+    }
+
+    // Target the LIVE set, not the raw count. Dead entries parked at the target
+    // size used to block top-up entirely, so the pool sat at its quota ceiling
+    // holding mostly-dead members while the source list went unread — the reason
+    // a 16-slot free pool ended up contributing about one working exit.
+    const live = this.pool.view().filter((e) => e.source === 'free' && e.state !== 'dead').length
+    const need = Math.max(0, this.config.pool.freeTargetSize - live)
     if (need === 0) return
     try {
-      const candidates = await this.#sources.fetchAll(need * 2)
+      const candidates = await this.#sources.fetchAll(need * 4)
       let added = 0
       for (const candidate of candidates) {
-        if (this.pool.has(candidate.id)) continue
-        this.pool.add(candidate)
-        added += 1
         if (added >= need) break
+        if (this.pool.has(candidate.id) || this.#freeRejected.has(candidate.id)) continue
+        this.pool.add(candidate)
+        this.#freeAdmitted.add(candidate.id)
+        added += 1
       }
       if (added > 0) {
         this.logger.child('pool').info('admitted free candidates', { added, total: this.pool.size() })

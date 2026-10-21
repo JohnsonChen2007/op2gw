@@ -319,3 +319,79 @@ test('markGate: cools the exit, bans the pair, survives probes, escalates', () =
   const v2 = pool.view().find((v) => v.id === 'http://a:1')!
   assert.equal(v2.cooling, false)
 })
+
+test('a free exit earns rotation slots only after a probe passes', () => {
+  const pool = new ExitPool()
+  pool.add(node('http://lottery:1', { source: 'free' }))
+  assert.equal(
+    pool.isUsable('http://lottery:1', 'm'),
+    false,
+    'an unproven free exit stays out of rotation — serving it costs a connect timeout',
+  )
+  // The model-ban relief path must not sneak one in either.
+  assert.equal(
+    pool.pick('m', 'sess-1'),
+    null,
+    'with only an unproven free exit available the pool reports no candidate',
+  )
+
+  pool.markProbe('http://lottery:1', true, 900, '203.0.113.7')
+  assert.equal(pool.isUsable('http://lottery:1', 'm'), true, 'a passed probe earns the slot')
+  assert.equal(pool.pick('m', 'sess-1')?.exit.id, 'http://lottery:1')
+})
+
+test('a manual exit stays usable while unprobed (restart must not starve)', () => {
+  let now = 1_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://manual:1'))
+  assert.equal(
+    pool.isUsable('http://manual:1', 'm'),
+    true,
+    "manual 'unknown' means not-yet-reverified, and hand-configured exits are trusted",
+  )
+  pool.markFailure('http://manual:1', 'm', 'transport')
+  assert.equal(pool.isUsable('http://manual:1', 'm'), false, 'the transport cooldown itself still applies')
+  now += 60_001
+  assert.equal(pool.isUsable('http://manual:1', 'm'), true, 'manual unknown after the cooldown is retryable')
+})
+
+test('a starved pool samples short cool-downs instead of refusing', () => {
+  let now = 1_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://a:1'))
+  pool.add(node('http://b:1'))
+  pool.add(node('http://long:1'))
+  pool.markFailure('http://a:1', 'm', 'limited')
+  pool.markFailure('http://b:1', 'm', 'limited')
+  // Escalate the third to a full quota back-off (60s x 10) — that one stays out.
+  for (let i = 0; i < 5; i += 1) pool.markFailure('http://long:1', 'm', 'limited')
+
+  assert.equal(pool.isUsable('http://a:1', 'm'), false, 'every exit is cooling, so tier 1 is empty')
+  const picked = pool.pick('m', 'starved-sess')
+  assert.ok(picked, 'a short-cooled exit is sampled rather than the client being refused')
+  assert.ok(
+    picked && (picked.exit.id === 'http://a:1' || picked.exit.id === 'http://b:1'),
+    `short cool-downs qualify, got ${picked?.exit.id}`,
+  )
+
+  const strict = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  strict.add(node('http://only-long:1'))
+  for (let i = 0; i < 5; i += 1) strict.markFailure('http://only-long:1', 'm', 'limited')
+  assert.equal(strict.pick('m', 'sess-2'), null, 'a long quota cool-down is still refused — probing it is futile')
+})
+
+test('the cool-down relief never overrides an identity-gate ban', () => {
+  let now = 5_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://g:1'))
+  pool.markGate('http://g:1', 'm')
+  assert.equal(
+    pool.pick('m', 'sess-1'),
+    null,
+    'the gate verdict is a model×exit ban; the cool-down tier must not route around it',
+  )
+  assert.ok(
+    pool.pick('other-model', 'sess-2'),
+    'the same exit is still worth sampling for a model the gate never judged',
+  )
+})

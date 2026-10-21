@@ -26,6 +26,16 @@ export interface SourceState {
 const LINE_RE = /^(https?|socks5h?|socks4?):\/\/[^\s]+$/i
 const HOSTPORT_RE = /^([a-z0-9.\-]+):(\d{2,5})$/i
 
+/** Fisher-Yates in place — used to sample free-proxy lists evenly. */
+function shuffle(list: string[]): void {
+  for (let i = list.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1))
+    const tmp = list[i]!
+    list[i] = list[j]!
+    list[j] = tmp
+  }
+}
+
 /**
  * Lowercase only the scheme and host of a proxy URI. The userinfo part
  * (`user:password`) is preserved verbatim — passwords are case-sensitive and
@@ -159,10 +169,24 @@ export class FreeSources {
         const res = await this.#fetch(state.url, { signal: controller.signal }).finally(() => clearTimeout(timer))
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         const text = await res.text()
-        let count = 0
+        const parsed: string[] = []
+        const local = new Set<string>()
         for (const line of text.split(/\r?\n/)) {
           const uri = parseProxyLine(line)
-          if (!uri || seen.has(uri)) continue
+          if (!uri || local.has(uri)) continue
+          local.add(uri)
+          parsed.push(uri)
+        }
+        // Sample a different slice of the list on every cycle. These lists keep a
+        // stable order and are mostly dead on arrival, so always taking the head
+        // re-tests the same addresses forever while every other line goes
+        // unread — the pool then churns in place and never accumulates proxies
+        // that would actually work (observed 2026-10-21: 16 head-of-file picks,
+        // 14 dead, while the tail was never tried).
+        shuffle(parsed)
+        let count = 0
+        for (const uri of parsed) {
+          if (seen.has(uri)) continue
           seen.add(uri)
           out.push(proxyToExit(uri))
           count += 1
