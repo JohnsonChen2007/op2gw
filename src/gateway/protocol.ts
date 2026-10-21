@@ -108,15 +108,46 @@ function responsesEffortOf(body: Json): string | undefined {
 // ---------------------------------------------------------------------------
 
 /**
- * Backfill every `role: "tool"` message's `tool_call_id` before the body leaves
- * for the chat wire.
+ * Placeholder written when a client history contains an assistant `tool_calls`
+ * entry that nothing ever answered. The provider 400s the whole request
+ * otherwise (`insufficient tool messages following tool_call`); a closed round
+ * with an explicit gap lets the conversation continue.
+ */
+const MISSING_TOOL_RESULT = '[op2gw] no tool result was provided for this call'
+
+function declaredChatToolId(msg: Json): string {
+  if (typeof msg.tool_call_id === 'string' && msg.tool_call_id.length > 0) return msg.tool_call_id
+  if (typeof msg.call_id === 'string' && msg.call_id.length > 0) return msg.call_id
+  return ''
+}
+
+function isToolCallAssistant(msg: Json): boolean {
+  return msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0
+}
+
+function mergeAssistantContent(prev: unknown, next: unknown): unknown {
+  const empty = (value: unknown): boolean => value === null || value === undefined || value === ''
+  if (empty(next)) return prev
+  if (empty(prev)) return next
+  if (typeof prev === 'string' && typeof next === 'string') return `${prev}\n${next}`
+  if (Array.isArray(prev) && Array.isArray(next)) return [...prev, ...next]
+  return prev
+}
+
+/**
+ * Backfill every `role: "tool"` message's `tool_call_id`, and close every
+ * assistant tool round, before the body leaves for the chat wire.
  *
  * The provider behind Zen rejects a tool message whose `tool_call_id` is
  * absent with `[400] messages[N]: tool messages must include a non-empty
  * string tool_call_id`, and every request-path rotation then fails identically
  * (observed 2026-10-01 across two independent exits — the body, not the
- * exits, was wrong). Clients are sloppy in three distinct ways, all handled
- * here:
+ * exits, was wrong). A second rejection, observed 2026-10-21 from every agent
+ * on this gateway, is `[invalid_request_error] An assistant message with
+ * 'tool_calls' must be followed by tool messages responding to each
+ * 'tool_call_id' (insufficient tool messages following tool_call…)`.
+ *
+ * Clients are sloppy in five distinct ways, all handled here:
  *
  *   1. the field is present but spelled `call_id` (Responses-style naming on
  *      the chat surface);
@@ -125,7 +156,15 @@ function responsesEffortOf(body: Json): string | undefined {
  *      claimed yet;
  *   3. an unpaired orphan keeps its (empty) id: Zen tolerates the present-but-
  *      empty shape, and inventing an id that matches nothing is worse than
- *      leaving it empty.
+ *      leaving it empty;
+ *   4. parallel calls were split into consecutive assistant messages (the
+ *      responses→chat translator used to emit one assistant per function_call).
+ *      Those are merged into a single assistant turn so the following tool
+ *      messages can answer all of them;
+ *   5. a call id never receives a tool message before the next user/assistant
+ *      turn (aborted tool, compacted history, cancelled parallel call). The
+ *      matching result is pulled forward when it exists later in the transcript;
+ *      otherwise a placeholder tool message is inserted so the round is closed.
  *
  * Well-formed bodies are returned by reference (no copy). The function runs
  * on the WIRE body, so it normalizes chat passthroughs and the output of
@@ -137,75 +176,160 @@ export function normalizeChatToolCallIds(body: Json): Json {
   const pending: string[] = [] // unclaimed assistant tool_call ids, FIFO
   let changed = false
   const out: unknown[] = []
+  const skip = new Set<number>()
   let synthesized = 0
-  for (const raw of messages) {
-    if (!isRecord(raw)) {
-      out.push(raw)
-      continue
-    }
-    const msg = raw
-    const role = typeof msg.role === 'string' ? msg.role : ''
-    if (role === 'assistant' && Array.isArray(msg.tool_calls)) {
-      // An assistant call entry without an id makes the whole tool round
-      // invalid on the provider side even when every tool message carries an
-      // id — synthesize one and queue it so the matching result pairs to it.
-      let callsChanged = false
-      const calls = msg.tool_calls.map((rawCall) => {
-        if (!isRecord(rawCall)) return rawCall
-        const call = rawCall
-        if (typeof call.id === 'string' && call.id.length > 0) {
-          pending.push(call.id)
-          return call
-        }
-        const id = `op2gw_call_${synthesized++}`
-        pending.push(id)
-        callsChanged = true
-        return { ...call, id }
-      })
-      if (callsChanged) {
-        changed = true
-        out.push({ ...msg, tool_calls: calls })
-      } else {
-        out.push(msg)
-      }
-      continue
-    }
-    if (role !== 'tool') {
-      out.push(msg)
-      continue
-    }
-    const declared =
-      typeof msg.tool_call_id === 'string' && msg.tool_call_id.length > 0
-        ? msg.tool_call_id
-        : typeof msg.call_id === 'string' && msg.call_id.length > 0
-          ? msg.call_id
-          : ''
+
+  const claim = (id: string): void => {
+    const at = pending.indexOf(id)
+    if (at >= 0) pending.splice(at, 1)
+  }
+
+  const absorbTool = (msg: Json): void => {
+    const declared = declaredChatToolId(msg)
     if (declared) {
-      const at = pending.indexOf(declared)
-      if (at >= 0) pending.splice(at, 1)
+      claim(declared)
       if (msg.tool_call_id !== declared) {
         changed = true
         out.push({ ...msg, tool_call_id: declared })
       } else {
         out.push(msg)
       }
-      continue
+      return
     }
     const paired = pending.shift()
     if (paired !== undefined && paired !== '') {
       changed = true
       out.push({ ...msg, tool_call_id: paired })
+      return
+    }
+    // Unpaired: Zen accepts the present-but-empty shape. Only rewrite when
+    // the field is absent, so a genuinely-empty id is left byte-identical.
+    if (typeof msg.tool_call_id !== 'string') {
+      changed = true
+      out.push({ ...msg, tool_call_id: '' })
     } else {
-      // Unpaired: Zen accepts the present-but-empty shape. Only rewrite when
-      // the field is absent, so a genuinely-empty id is left byte-identical.
-      if (typeof msg.tool_call_id !== 'string') {
+      out.push(msg)
+    }
+  }
+
+  const collectCalls = (toolCalls: unknown[]): { calls: unknown[]; changedCalls: boolean } => {
+    let changedCalls = false
+    const calls = toolCalls.map((rawCall) => {
+      if (!isRecord(rawCall)) return rawCall
+      if (typeof rawCall.id === 'string' && rawCall.id.length > 0) {
+        pending.push(rawCall.id)
+        return rawCall
+      }
+      const id = `op2gw_call_${synthesized++}`
+      pending.push(id)
+      changedCalls = true
+      return { ...rawCall, id }
+    })
+    return { calls, changedCalls }
+  }
+
+  // Tool messages that answer the open round, including ones stranded after a
+  // later user turn. Declared ids are unique to the call that minted them, so
+  // they can be pulled from anywhere later. Id-less results are positional and
+  // stop at the next assistant tool round so they are not stolen from it.
+  const selectToolIndexes = (from: number): number[] => {
+    const need = new Map<string, number>()
+    for (const id of pending) need.set(id, (need.get(id) ?? 0) + 1)
+    const used = new Map<string, number>()
+    const declaredIdx: number[] = []
+    for (let j = from; j < messages.length; j += 1) {
+      if (skip.has(j)) continue
+      const raw = messages[j]
+      if (!isRecord(raw) || raw.role !== 'tool') continue
+      const declared = declaredChatToolId(raw)
+      if (!declared) continue
+      const have = used.get(declared) ?? 0
+      const want = need.get(declared) ?? 0
+      if (have >= want) continue
+      used.set(declared, have + 1)
+      declaredIdx.push(j)
+    }
+    let positionalBudget = 0
+    for (const [id, count] of need) positionalBudget += Math.max(0, count - (used.get(id) ?? 0))
+    const positionalIdx: number[] = []
+    for (let j = from; j < messages.length && positionalIdx.length < positionalBudget; j += 1) {
+      if (skip.has(j) || declaredIdx.includes(j)) continue
+      const raw = messages[j]
+      if (!isRecord(raw)) continue
+      if (isToolCallAssistant(raw)) break
+      if (raw.role !== 'tool') continue
+      if (declaredChatToolId(raw) !== '') continue
+      positionalIdx.push(j)
+    }
+    return [...declaredIdx, ...positionalIdx].sort((a, b) => a - b)
+  }
+
+  const closeRound = (from: number): void => {
+    if (pending.length === 0) return
+    const taken = selectToolIndexes(from)
+    if (taken.length > 0) changed = true
+    for (const j of taken) {
+      skip.add(j)
+      const raw = messages[j]
+      if (isRecord(raw)) absorbTool(raw)
+    }
+    while (pending.length > 0) {
+      const id = pending.shift()
+      if (id === undefined || id.length === 0) continue
+      changed = true
+      out.push({ role: 'tool', tool_call_id: id, content: MISSING_TOOL_RESULT })
+    }
+  }
+
+  for (let i = 0; i < messages.length; i += 1) {
+    if (skip.has(i)) continue
+    const raw = messages[i]
+    if (!isRecord(raw)) {
+      closeRound(i)
+      out.push(raw)
+      continue
+    }
+    const msg = raw
+    const role = typeof msg.role === 'string' ? msg.role : ''
+    if (isToolCallAssistant(msg)) {
+      const prev = out[out.length - 1]
+      const prevIsOpen =
+        pending.length > 0 &&
+        isRecord(prev) &&
+        isToolCallAssistant(prev) &&
+        (prev.tool_calls as unknown[]).every((call) => {
+          if (!isRecord(call) || typeof call.id !== 'string' || call.id.length === 0) return false
+          return pending.includes(call.id)
+        })
+      if (!prevIsOpen && pending.length > 0) closeRound(i)
+      // Collect AFTER closing the previous round so its placeholder results
+      // are not paired with this assistant's fresh call ids.
+      const collected = collectCalls(msg.tool_calls as unknown[])
+      if (prevIsOpen && isRecord(prev)) {
         changed = true
-        out.push({ ...msg, tool_call_id: '' })
+        out[out.length - 1] = {
+          ...prev,
+          content: mergeAssistantContent(prev.content, msg.content),
+          tool_calls: [...(prev.tool_calls as unknown[]), ...collected.calls],
+        }
+        continue
+      }
+      if (collected.changedCalls) {
+        changed = true
+        out.push({ ...msg, tool_calls: collected.calls })
       } else {
         out.push(msg)
       }
+      continue
     }
+    if (role === 'tool') {
+      absorbTool(msg)
+      continue
+    }
+    closeRound(i)
+    out.push(msg)
   }
+  closeRound(messages.length)
   return changed ? { ...body, messages: out } : body
 }
 
@@ -226,7 +350,10 @@ export function normalizeChatToolCallIds(body: Json): Json {
  *     that breaks any tool-using conversation on a Responses-wire model.
  */
 export function chatToResponsesBody(body: Json): Json {
-  const messages = Array.isArray(body.messages) ? (body.messages as unknown[]) : []
+  // Close chat tool rounds first so a missing tool result becomes a
+  // function_call_output instead of a Responses 400 ("No tool output found").
+  const source = normalizeChatToolCallIds(body)
+  const messages = Array.isArray(source.messages) ? (source.messages as unknown[]) : []
   const instructions: string[] = []
   const input: Json[] = []
   // Unclaimed function_call ids so an output whose tool_call_id is missing or
@@ -285,30 +412,30 @@ export function chatToResponsesBody(body: Json): Json {
   }
 
   const out: Json = {
-    model: body.model,
+    model: source.model,
     input: input.length > 0 ? input : [{ role: 'user', content: '' }],
-    stream: body.stream !== false,
+    stream: source.stream !== false,
   }
   const instructionsText = instructions.join('\n\n')
   if (instructionsText.length > 0) out.instructions = instructionsText
-  if (typeof body.temperature === 'number') out.temperature = body.temperature
-  if (typeof body.top_p === 'number') out.top_p = body.top_p
-  const maxTokens = body.max_tokens ?? body.max_completion_tokens
+  if (typeof source.temperature === 'number') out.temperature = source.temperature
+  if (typeof source.top_p === 'number') out.top_p = source.top_p
+  const maxTokens = source.max_tokens ?? source.max_completion_tokens
   // Upstream Responses providers (such as Console for muse-spark) require max_output_tokens >= 16.
   if (typeof maxTokens === 'number') out.max_output_tokens = Math.max(16, maxTokens)
-  if (typeof body.parallel_tool_calls === 'boolean') out.parallel_tool_calls = body.parallel_tool_calls
-  if (typeof body.user === 'string') out.metadata = { user_id: body.user }
+  if (typeof source.parallel_tool_calls === 'boolean') out.parallel_tool_calls = source.parallel_tool_calls
+  if (typeof source.user === 'string') out.metadata = { user_id: source.user }
 
   // Reasoning effort: flat chat field -> nested Responses field. Dropping this
   // is invisible in the response but silently caps the model at default effort.
-  const effort = chatEffortOf(body)
+  const effort = chatEffortOf(source)
   if (effort !== undefined) out.reasoning = { effort }
 
-  const tools = Array.isArray(body.tools) ? body.tools : []
+  const tools = Array.isArray(source.tools) ? source.tools : []
   const mapped = tools.map(chatToolToResponses).filter((t): t is Json => t !== null)
   if (mapped.length > 0) out.tools = mapped
 
-  const choice = chatToolChoiceToResponses(body.tool_choice)
+  const choice = chatToolChoiceToResponses(source.tool_choice)
   if (choice !== undefined) out.tool_choice = choice
   return out
 }
@@ -332,19 +459,24 @@ export function responsesToChatBody(body: Json): Json {
     const type = typeof item.type === 'string' ? item.type : ''
     if (type === 'reasoning') continue
     if (type === 'function_call') {
-      messages.push({
-        role: 'assistant',
-        tool_calls: [
-          {
-            id: String(item.call_id ?? item.id ?? 'call_0'),
-            type: 'function',
-            function: {
-              name: String(item.name ?? ''),
-              arguments: normalizeBashToolArguments(String(item.name ?? ''), String(item.arguments ?? '')),
-            },
-          },
-        ],
-      })
+      // Parallel calls are one assistant turn on the chat surface. Emitting a
+      // fresh assistant per function_call makes the first call's tool_calls
+      // be followed by another assistant, which upstream rejects with
+      // "insufficient tool messages following tool_call".
+      const call = {
+        id: String(item.call_id ?? item.id ?? 'call_0'),
+        type: 'function',
+        function: {
+          name: String(item.name ?? ''),
+          arguments: normalizeBashToolArguments(String(item.name ?? ''), String(item.arguments ?? '')),
+        },
+      }
+      const prev = messages[messages.length - 1]
+      if (isRecord(prev) && prev.role === 'assistant' && Array.isArray(prev.tool_calls)) {
+        prev.tool_calls.push(call)
+      } else {
+        messages.push({ role: 'assistant', tool_calls: [call] })
+      }
       continue
     }
     if (type === 'function_call_output') {
@@ -445,6 +577,130 @@ export function stripCallerBoundReasoning(body: Json): Json {
   if (include !== null) out.include = include
   else delete out.include
   return out
+}
+
+function declaredResponsesCallId(item: Json): string {
+  if (typeof item.call_id === 'string' && item.call_id.length > 0) return item.call_id
+  if (item.type === 'function_call' && typeof item.id === 'string' && item.id.length > 0) return item.id
+  return ''
+}
+
+/**
+ * Close every Responses `function_call` that has no `function_call_output`.
+ *
+ * Chat clients are repaired before translation. A Responses passthrough
+ * (Codex on a muse-spark model) never enters that path, and the same aborted
+ * or compacted history 400s upstream as "No tool output found for function
+ * call". Reasoning items are transparent: they are stripped separately and
+ * must not split a call from its output.
+ *
+ * Well-formed input is returned by reference.
+ */
+export function closeUnansweredFunctionCalls(body: Json): Json {
+  if (!Array.isArray(body.input)) return body
+  const items = body.input as unknown[]
+  const pending: string[] = []
+  const out: unknown[] = []
+  const skip = new Set<number>()
+  let changed = false
+
+  const claim = (id: string): void => {
+    const at = pending.indexOf(id)
+    if (at >= 0) pending.splice(at, 1)
+  }
+
+  const absorbOutput = (item: Json): void => {
+    const declared = declaredResponsesCallId(item)
+    if (declared) {
+      claim(declared)
+      out.push(item)
+      return
+    }
+    const paired = pending.shift()
+    if (paired !== undefined && paired.length > 0) {
+      changed = true
+      out.push({ ...item, call_id: paired })
+      return
+    }
+    out.push(item)
+  }
+
+  const selectOutputIndexes = (from: number): number[] => {
+    const need = new Map<string, number>()
+    for (const id of pending) need.set(id, (need.get(id) ?? 0) + 1)
+    const used = new Map<string, number>()
+    const declaredIdx: number[] = []
+    for (let j = from; j < items.length; j += 1) {
+      if (skip.has(j)) continue
+      const raw = items[j]
+      if (!isRecord(raw) || raw.type !== 'function_call_output') continue
+      const declared = declaredResponsesCallId(raw)
+      if (!declared) continue
+      const have = used.get(declared) ?? 0
+      const want = need.get(declared) ?? 0
+      if (have >= want) continue
+      used.set(declared, have + 1)
+      declaredIdx.push(j)
+    }
+    let positionalBudget = 0
+    for (const [id, count] of need) positionalBudget += Math.max(0, count - (used.get(id) ?? 0))
+    const positionalIdx: number[] = []
+    for (let j = from; j < items.length && positionalIdx.length < positionalBudget; j += 1) {
+      if (skip.has(j) || declaredIdx.includes(j)) continue
+      const raw = items[j]
+      if (!isRecord(raw) || raw.type === 'reasoning') continue
+      if (raw.type === 'function_call') break
+      if (raw.type !== 'function_call_output') continue
+      if (declaredResponsesCallId(raw) !== '') continue
+      positionalIdx.push(j)
+    }
+    return [...declaredIdx, ...positionalIdx].sort((a, b) => a - b)
+  }
+
+  const closeRound = (from: number): void => {
+    if (pending.length === 0) return
+    const taken = selectOutputIndexes(from)
+    if (taken.length > 0) changed = true
+    for (const j of taken) {
+      skip.add(j)
+      const raw = items[j]
+      if (isRecord(raw)) absorbOutput(raw)
+    }
+    while (pending.length > 0) {
+      const id = pending.shift()
+      if (id === undefined || id.length === 0) continue
+      changed = true
+      out.push({ type: 'function_call_output', call_id: id, output: MISSING_TOOL_RESULT })
+    }
+  }
+
+  for (let i = 0; i < items.length; i += 1) {
+    if (skip.has(i)) continue
+    const raw = items[i]
+    if (!isRecord(raw)) {
+      closeRound(i)
+      out.push(raw)
+      continue
+    }
+    if (raw.type === 'function_call') {
+      const id = declaredResponsesCallId(raw)
+      if (id.length > 0) pending.push(id)
+      out.push(raw)
+      continue
+    }
+    if (raw.type === 'function_call_output') {
+      absorbOutput(raw)
+      continue
+    }
+    if (raw.type === 'reasoning') {
+      out.push(raw)
+      continue
+    }
+    closeRound(i)
+    out.push(raw)
+  }
+  closeRound(items.length)
+  return changed ? { ...body, input: out } : body
 }
 
 /** Flatten any chat content shape into plain text (for `instructions`). */

@@ -13,6 +13,7 @@ import {
   chatToResponsesBody,
   chatToResponsesCompletion,
   chatToResponsesStream,
+  closeUnansweredFunctionCalls,
   isResponsesWireModel,
   normalizeChatToolCallIds,
   resolveUpstreamApi,
@@ -529,7 +530,8 @@ export class Gateway {
       // echo arrives under a different one. stripCallerBoundReasoning explains
       // the full chain (protocol.ts).
       const sanitized = stripCallerBoundReasoning(translated)
-      const { body: shaped } = ensureResponsesFreeLaneShape(sanitized)
+      const repaired = closeUnansweredFunctionCalls(sanitized)
+      const { body: shaped } = ensureResponsesFreeLaneShape(repaired)
       return shaped
     }
     const translated = clientApi === 'responses' ? responsesToChatBody(body) : body
