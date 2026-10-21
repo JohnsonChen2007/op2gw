@@ -102,6 +102,13 @@ export class Runtime {
       banTtlMs: config.pool.banTtlMs,
       deadRecheckMs: config.selfHeal.deadRecheckMs,
       deadEvictions: config.selfHeal.deadEvictions,
+      // A quota 429's Retry-After is the real window reset (hours), not a
+      // precautionary backoff — credit it or the pool re-samples a burned
+      // egress every cooldownMs for as long as the window lasts.
+      honorRetryAfter: config.pool.honorRetryAfter,
+      maxCooldownMs: config.pool.maxCooldownMs,
+      // Spread concurrent work across egress IPs instead of draining one.
+      maxInflightPerExit: config.pool.maxInflightPerExit,
     })
 
     // Seed the pool. Direct is only registered when includeDirect is true.
@@ -164,6 +171,9 @@ export class Runtime {
       // Non-streaming bodies have no idle watchdog, so this budget is the only
       // thing keeping a half-open upstream from hanging a request forever.
       bodyBudgetMs: config.bodyBudgetMs,
+      // Bounds the pre-content rotation loop in wall-clock terms: attempt count
+      // alone let a dirty pool hold a request for attempt-count x connect-timeout.
+      rotateBudgetMs: config.pool.rotateBudgetMs,
       // Refusing a request is also a recovery signal: verify every exit right
       // now (multi-site) instead of waiting for the scheduled probe rounds.
       onPoolStarved: () => this.#recoverPool(),

@@ -230,6 +230,54 @@ function generateConfig(nodes, basePort) {
   return { log: { loglevel: 'warning' }, inbounds, outbounds, routing: { domainStrategy: 'AsIs', rules } }
 }
 
+/**
+ * Rewrite the sidecar to keep only one inbound per DISTINCT EGRESS IP.
+ *
+ * Node addresses and egress IPs are not the same thing: a proxy can front a
+ * provider's shared pool, so several "distinct" node addresses leave through one
+ * IP (measured 2026-10-22: 10808 and 21006 both exited at 47.131.86.109, and
+ * once that IP's free-lane quota ran out both 429'd in the same second). Every
+ * alias slot costs a probe round and buys nothing, and the gateway's rotation
+ * budget would count it as an extra chance.
+ *
+ * Runs AFTER `verify` (which measures the real IPs). Exits that are dead at
+ * verify time are dropped too. The written config is renumbered so ports stay
+ * contiguous from basePort.
+ */
+function dedupeInboundsByEgress(config, basePort, results) {
+  const byPort = new Map(results.map((r) => [r.port, r.ip]))
+  const kept = []
+  const seenIP = new Map()
+  const dropped = []
+  config.inbounds.forEach((inbound, i) => {
+    const ip = byPort.get(inbound.port) ?? ''
+    if (!ip) {
+      dropped.push({ port: inbound.port, reason: 'dead' })
+      return
+    }
+    if (seenIP.has(ip)) {
+      dropped.push({ port: inbound.port, reason: `shared egress ${ip} (kept ${seenIP.get(ip)})` })
+      return
+    }
+    seenIP.set(ip, inbound.port)
+    kept.push({ inbound, outbound: config.outbounds[i], rule: config.routing.rules[i], ip })
+  })
+  const inbounds = []
+  const outbounds = []
+  const rules = []
+  kept.forEach((entry, i) => {
+    const port = basePort + i
+    inbounds.push({ ...entry.inbound, port, tag: `in-${port}` })
+    outbounds.push({ ...entry.outbound, tag: `out-${port}` })
+    rules.push({ type: 'field', inboundTag: [`in-${port}`], outboundTag: `out-${port}` })
+  })
+  return {
+    config: { ...config, inbounds, outbounds, routing: { ...config.routing, rules } },
+    kept,
+    dropped,
+  }
+}
+
 async function verify(basePort, count, timeoutMs) {
   const results = []
   for (let i = 0; i < count; i += 1) {
@@ -267,7 +315,7 @@ if (mode === 'verify') {
 }
 
 if (mode !== 'gen') {
-  process.stdout.write('usage: xray-pool.mjs gen|verify [--count N] [--base-port P] [--addresses a,b] [--db path] [--out file]\n')
+  process.stdout.write('usage: xray-pool.mjs gen|verify [--count N] [--base-port P] [--addresses a,b] [--db path] [--out file] [--dedupe-egress]\n')
   process.exit(1)
 }
 
@@ -294,19 +342,38 @@ if (nodes.length < count) {
   process.exit(1)
 }
 
-const config = generateConfig(nodes, basePort)
+let config = generateConfig(nodes, basePort)
 mkdirSync(outDir, { recursive: true })
 const outPath = args.out ?? join(DEFAULT_OUT_DIR, 'config.json')
+let written = nodes
+
+// Optionally collapse the sidecar to one inbound per distinct EGRESS IP.
+// Node-address dedup (selectNodes) cannot see that two different proxies leave
+// through the same IP, and the free lane meters quota per egress IP — so an
+// alias slot costs a probe round and delivers no extra quota.
+if (args['dedupe-egress'] || args.verify) {
+  const results = await verify(basePort, nodes.length, Number(args.timeout ?? 15000))
+  const deduped = dedupeInboundsByEgress(config, basePort, results)
+  config = deduped.config
+  written = deduped.kept.map((k) => k.ip)
+  for (const drop of deduped.dropped) {
+    process.stdout.write(`  dropped port ${drop.port}: ${drop.reason}\n`)
+  }
+  process.stdout.write(`\n  distinct egress IPs: ${written.length} (from ${nodes.length} node slots)\n`)
+}
+
 writeFileSync(outPath, JSON.stringify(config, null, 2))
 
-process.stdout.write(`xray-pool: wrote ${outPath} (${nodes.length} exits, ports ${basePort}-${basePort + nodes.length - 1})\n\n`)
+const ports = config.inbounds.length
+process.stdout.write(`\nxray-pool: wrote ${outPath} (${ports} exits, ports ${basePort}-${basePort + Math.max(0, ports - 1)})\n\n`)
 process.stdout.write('  PORT     EXIT(NODE)                      PROTOCOL\n')
 nodes.forEach((row, i) => {
+  if (i >= ports) return
   const label = `${row.address}:${row.port}`
   const name = (row.remarks || '(unnamed)').slice(0, 28)
   const proto = `${Number(row.configType) === 1 ? 'vmess' : 'vless'}/${row.network || 'raw'}/${row.streamSecurity || 'none'}`
   process.stdout.write(`  ${basePort + i}  ${label.padEnd(30)}  ${proto}  ${name}\n`)
 })
 process.stdout.write(`\n  op2gw pool URIs:\n`)
-nodes.forEach((_, i) => process.stdout.write(`    socks5://127.0.0.1:${basePort + i}\n`))
+for (let i = 0; i < ports; i += 1) process.stdout.write(`    socks5://127.0.0.1:${basePort + i}\n`)
 copyFileSync(db, join(outDir, 'v2rayn-db.snapshot.sqlite'))

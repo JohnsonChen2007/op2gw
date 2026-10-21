@@ -40,6 +40,19 @@ const MAX_BACKOFF_MS = 4_000
 const DEFAULT_BODY_BUDGET_MS = 10 * 60_000
 
 /**
+ * Default wall-clock ceiling (ms) for the pre-content rotation loop.
+ *
+ * A streaming attempt costs at most its first-byte window (30s), and the pool's
+ * connect timeout is 6s, so a handful of unlucky exits can otherwise hold a
+ * request — and the client's own timeout — for minutes before ANY answer.
+ * 45s is sized from the measured healthy path (0.7-3.5s) plus the connect
+ * timeout of a couple of duds: long enough to survive one or two bad exits,
+ * short enough that a caller sees a real error inside a chat round-trip.
+ * A non-streaming body budget is separate (bodyBudgetMs) and still applies.
+ */
+const DEFAULT_ROTATE_BUDGET_MS = 45_000
+
+/**
  * Gateway — the request orchestrator.
  *
  * Responsibilities for one OpenAI v1 request:
@@ -91,6 +104,14 @@ export interface GatewayDeps {
    * request forever. 0 disables the budget. Defaults to 10 minutes.
    */
   bodyBudgetMs?: number
+  /**
+   * Wall-clock ceiling (ms) for the pre-content ROTATION loop. Bounds how long
+   * a request may spend hopping between bad exits before it surfaces the last
+   * real upstream error. Does not bound the streaming body once it has started
+   * (that is the idle watchdog's job) nor the non-streaming body budget.
+   * 0 disables. Defaults to 45s.
+   */
+  rotateBudgetMs?: number
 }
 
 export interface GatewayRequest {
@@ -171,15 +192,29 @@ export class Gateway {
     const toolSchemas = buildToolSchemas(req.body)
 
     // Rotate budget: on a 429 (or other exit-shaped failure) we want to keep
-    // hopping to a *different* IP until we run out of usable exits. So the
-    // effective budget tracks the pool size — one shot per distinct exit — and
+    // hopping to a *different* egress until we run out of usable ones. So the
+    // effective budget tracks the usable pool — one shot per candidate — and
     // the configured maxRotateAttempts acts as the floor (a minimum guarantee
     // even for a tiny pool). This is what makes "rate-limited -> switch IP"
-    // actually traverse the whole pool instead of giving up after 2-3 tries.
-    const poolSize = this.#d.pool.size()
-    let maxAttempts = this.#d.poolEnabled
-      ? Math.max(1, this.#d.maxRotateAttempts, poolSize)
-      : 1
+    // actually traverse the pool instead of giving up after 2-3 tries.
+    //
+    // It tracks USABLE exits, not registered ones. The old `pool.size()` counted
+    // every dead/cooled/banned slot too, so a dirty pool of 25 with 4 live exits
+    // burned 25 attempts — each dead slot costing a full connect timeout before
+    // the request gave up (measured 2026-10-22: worst-case interactive latency
+    // was attempt-count x 6s).
+    const usable = this.#d.poolEnabled ? this.#d.pool.distinctEgressCount(model) : 1
+    let maxAttempts = this.#d.poolEnabled ? Math.max(1, this.#d.maxRotateAttempts, usable) : 1
+    /**
+     * Wall-clock ceiling for the whole rotation, and the reason a slow pool
+     * cannot stretch one request indefinitely. Without it the loop is bounded
+     * only by attempt count, and every attempt on a half-dead exit costs up to
+     * a full connect timeout — the "it hangs for two minutes then errors"
+     * failure mode. Once exceeded, we stop rotating and report the LAST real
+     * upstream verdict: a truthful error beats an even longer delay.
+     */
+    const rotateBudgetMs = this.#d.rotateBudgetMs ?? DEFAULT_ROTATE_BUDGET_MS
+    const rotationDeadline = rotateBudgetMs > 0 ? started + rotateBudgetMs : Number.POSITIVE_INFINITY
     const story: string[] = []
     /**
      * Set once we have flipped the wire dialect on upstream's objection.
@@ -194,6 +229,14 @@ export class Gateway {
     const triedExits = new Set<string>()
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      // Stop before spending another connect timeout once the wall-clock budget
+      // is gone. Checked at the top (not after a failure) so a request that is
+      // already over budget does not start a fresh attempt just to be cut off.
+      if (attempt > 1 && Date.now() >= rotationDeadline) {
+        story.push(`#${attempt} budget: rotation wall-clock budget exhausted before another attempt`)
+        log.warn('rotation budget exhausted', { model, attempt, tried: [...triedExits].length })
+        break
+      }
       const exit = this.#pickExit(model, ids.session, triedExits)
       if (!exit) {
         // Nobody is usable right now: ask the prober to verify every exit
@@ -223,6 +266,10 @@ export class Gateway {
           `direct egress is disallowed but no proxy exit is available for "${model}"; refusing to send it out over the direct path`,
         )
       }
+      // Hold a concurrency slot for this attempt. The pool caps in-flight
+      // requests per exit so a burst of long streams cannot drain one egress
+      // IP's quota; the release is idempotent and runs on every exit path.
+      const release = this.#d.pool.reserve(exit.id, model)
       try {
         const result = await forwardUpstream({
           zenBaseUrl: this.#d.zenBaseUrl,
@@ -274,6 +321,10 @@ export class Gateway {
           body = await this.#toClientCompletion(req.api, wireApi, result.rawBody, model, toolSchemas)
         }
 
+        // Release the streaming slot as soon as the response is handed off —
+        // the body is consumed by the client afterwards, and holding the slot
+        // for the whole stream would starve the exit for every other request.
+        release()
         this.#d.pool.markSuccess(exit.id, model)
         const trace: RequestTrace = {
           id: requestId,
@@ -291,6 +342,7 @@ export class Gateway {
         log.info('request ok', { model, exit: exit.id, attempt, stream: req.clientStream, api: wireApi, clientApi: req.api })
         return { status: 200, headers: this.#responseHeaders(req.clientStream), body, trace }
       } catch (err) {
+        release()
         lastError = err as Error
 
         // The client walked away. `req.signal` only fires on a real disconnect,
@@ -329,10 +381,17 @@ export class Gateway {
         const identityGate = isIdentityGate(err)
         // A 400 from upstream is a client/request validation error (e.g. invalid param,
         // malformed prompt). It is NOT an exit/proxy node failure and must NOT penalize the exit.
+        //
+        // The upstream's own reset time is handed to the pool for quota verdicts:
+        // Zen's free-lane window resets in HOURS (measured 2026-10-22:
+        // Retry-After 26843-26851s), so a local 60s backoff re-samples a burned
+        // egress all day long. Dropping that value here is exactly what made
+        // every request carry a pointless guaranteed-429 attempt.
+        const retryAfterMs = (err as UpstreamError).retryAfterMs
         if (identityGate) {
           this.#d.pool.markGate(exit.id, model)
         } else if (status !== 400) {
-          this.#d.pool.markFailure(exit.id, model, kind)
+          this.#d.pool.markFailure(exit.id, model, kind, retryAfterMs)
         }
         story.push(`#${attempt} ${exit.id} ${identityGate ? 'identity-gate' : kind}: ${(err as Error).message.slice(0, 80)}`)
         log.warn('attempt failed', { model, exit: exit.id, attempt, kind, error: (err as Error).message })
@@ -367,11 +426,24 @@ export class Gateway {
         // retry in lockstep and land on the recovering upstream all at once —
         // the fixed delay it replaces made every in-flight request retry
         // simultaneously.
-        const retryAfterMs = (err as UpstreamError).retryAfterMs
+        //
+        // Capped hard: a quota 429's Retry-After is the window RESET (hours),
+        // and the exit has already been cooled for that whole window by
+        // markFailure. Sleeping it out inside one request would hang the client
+        // for no gain — the next attempt goes to a DIFFERENT egress anyway.
+        // Never sleep past the rotation deadline either.
+        const remainingMs = rotationDeadline - Date.now()
+        if (remainingMs <= 0) {
+          // No budget left for another attempt: stop here rather than waking up
+          // to an immediate break at the top of the loop.
+          story.push(`#${attempt} budget: rotation wall-clock budget exhausted before backoff`)
+          break
+        }
+        const cap = Math.min(MAX_BACKOFF_MS, remainingMs)
         if (retryAfterMs !== undefined && retryAfterMs > 0) {
-          await sleep(Math.min(retryAfterMs, MAX_BACKOFF_MS))
+          await sleep(Math.min(retryAfterMs, cap))
         } else if (kind === 'server' || kind === 'limited') {
-          await sleep(Math.floor(Math.random() * Math.min(400 * 2 ** (attempt - 1), MAX_BACKOFF_MS)))
+          await sleep(Math.min(Math.floor(Math.random() * Math.min(400 * 2 ** (attempt - 1), MAX_BACKOFF_MS)), cap))
         }
       }
     }
@@ -427,6 +499,25 @@ export class Gateway {
       )
     }
     const status = (lastError as UpstreamError)?.status ?? 502
+    // A quota 429 that survived the whole rotation is a pool-wide exhaustion,
+    // not a per-request hiccup: say when the earliest window reopens so the
+    // caller knows whether retrying now is pointless. The alternative (a bare
+    // "Rate limit exceeded") reads like a transient blip and invites a tight
+    // retry loop against a pool that will refuse it for hours.
+    if (status === 429) {
+      const waiting = this.#d.pool.nextCooldownExpiryMs()
+      const windowHint =
+        waiting > 0
+          ? ` Earliest egress quota window reopens in ${Math.ceil(waiting / 60_000)} min.`
+          : ''
+      const rotations = story.length > 1 ? `rotated ${story.length - 1}x` : 'no rotation'
+      throw new GatewayHttpError(
+        429,
+        'rate_limit_exceeded',
+        `${lastError?.message ?? 'upstream rate limit'} (every exit tried is quota-exhausted — ` +
+          `the free lane meters quota per egress IP; op2gw ${rotations}: ${story.join(' -> ')}).${windowHint}`,
+      )
+    }
     const detail = story.length > 1 ? `${lastError?.message} (op2gw rotated ${story.length - 1}x: ${story.join(' -> ')})` : lastError?.message ?? 'upstream failure'
     throw new GatewayHttpError(status >= 400 ? status : 502, 'upstream_error', detail)
   }

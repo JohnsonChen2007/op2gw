@@ -30,7 +30,15 @@ interface ExitHealth {
    *  escalating 'gate' cooldown (same math as 'limited'). */
   consecutiveGate: number
   deadStrikes: number
+  /** True while a probe owns this exit (serializes probe rounds). */
   inflight: boolean
+  /** Requests currently being served through this exit, keyed by
+   *  `${exitId}\0${model}`. The free lane meters quota per egress IP, so
+   *  letting many long streams pile onto one IP burns its budget far faster
+   *  than spreading them; pick() consults this to enforce a per-exit cap. */
+  inflightByModel: Map<string, number>
+  /** Total in-flight over this exit across all models. */
+  inflightTotal: number
 }
 
 interface ModelBan {
@@ -49,6 +57,25 @@ export interface PoolOptions {
    *  becomes usable again. Prevents a transient refusal (e.g. a one-off 403 from
    *  hitting the wrong endpoint) from permanently stranding an exit×model pair. */
   banTtlMs?: number
+  /**
+   * Credit the upstream's `Retry-After` towards the exit's quota cooldown.
+   *
+   * The free lane meters quota per egress IP and answers an exhausted one with
+   * a 429 whose `Retry-After` is the REAL time until the window resets —
+   * measured 2026-10-22 at 26843-26851 seconds (~7.4h). Scaling that down to
+   * the configured cooldownMs (60s) made the pool re-sample a burned exit every
+   * minute for hours: every one of those attempts was a guaranteed 429 plus a
+   * connect round-trip on the request path. Default true.
+   */
+  honorRetryAfter?: boolean
+  /** Ceiling on a single Retry-After-derived cooldown (ms), so a hostile or
+   *  absurd header cannot park an exit for days. Default 8h. */
+  maxCooldownMs?: number
+  /**
+   * Max concurrent in-flight requests per exit (0 = unlimited). Default 4.
+   * Keeps one egress IP's quota from being drained by a burst of long streams.
+   */
+  maxInflightPerExit?: number
   now?: () => number
 }
 
@@ -62,6 +89,10 @@ export interface ExitView extends ExitNode {
   state: ExitState
   cooling: boolean
   cooldownRemainingMs: number
+  /** Live concurrency (total in flight through this exit). */
+  inflight: number
+  /** How long ago this exit was last verified, ms (0 = never). */
+  lastProbedAgoMs: number
 }
 
 /**
@@ -75,6 +106,18 @@ export interface ExitView extends ExitNode {
  * nothing.
  */
 const STARVED_COOLDOWN_BUDGET_MS = 120_000
+
+/**
+ * Default ceiling on a single Retry-After-derived cooldown. Zen's quota window
+ * resets in hours, so the ceiling must be generous; it only exists so a
+ * malformed or hostile header cannot bench an exit for days.
+ */
+const DEFAULT_MAX_COOLDOWN_MS = 8 * 60 * 60_000
+
+/** How long a cooled-down quota exit is excluded from the starved-pool relief.
+ *  Its 429 came with a real reset time; sampling it before that is a guaranteed
+ *  failure. Matches STARVED_COOLDOWN_BUDGET_MS so the two rules never disagree. */
+const QUOTA_RESET_GRACE_MS = STARVED_COOLDOWN_BUDGET_MS
 
 const DIRECT: ExitNode = {
   id: 'direct',
@@ -105,6 +148,9 @@ export class ExitPool {
   readonly #deadRecheckMs: number
   readonly #deadEvictions: number
   readonly #banTtlMs: number
+  readonly #honorRetryAfter: boolean
+  readonly #maxCooldownMs: number
+  readonly #maxInflightPerExit: number
   readonly #now: () => number
 
   constructor(options: PoolOptions = {}) {
@@ -112,7 +158,15 @@ export class ExitPool {
     this.#deadRecheckMs = options.deadRecheckMs ?? 5 * 60_000
     this.#deadEvictions = options.deadEvictions ?? 3
     this.#banTtlMs = options.banTtlMs ?? 10 * 60_000
+    this.#honorRetryAfter = options.honorRetryAfter ?? true
+    this.#maxCooldownMs = options.maxCooldownMs ?? DEFAULT_MAX_COOLDOWN_MS
+    this.#maxInflightPerExit = Math.max(0, options.maxInflightPerExit ?? 4)
     this.#now = options.now ?? Date.now
+  }
+
+  /** Live concurrency settings (read by the gateway for diagnostics). */
+  get maxInflightPerExit(): number {
+    return this.#maxInflightPerExit
   }
 
   setPinned(exitId: string): void {
@@ -162,6 +216,8 @@ export class ExitPool {
         consecutiveGate: 0,
         deadStrikes: 0,
         inflight: false,
+        inflightByModel: new Map(),
+        inflightTotal: 0,
       })
     }
   }
@@ -216,7 +272,96 @@ export class ExitPool {
     if (health.cooldownUntil > this.#now()) return false
     const ban = this.#bans.get(this.#banKey(exitId, model))
     if (ban && this.#banActive(ban)) return false
-    return true
+    return this.#hasCapacity(exitId)
+  }
+
+  /** Whether the exit is under its per-exit in-flight cap. */
+  #hasCapacity(exitId: string): boolean {
+    if (this.#maxInflightPerExit === 0) return true
+    const health = this.#health.get(exitId)
+    if (!health) return false
+    return health.inflightTotal < this.#maxInflightPerExit
+  }
+
+  /**
+   * Reserve one in-flight slot on an exit for the duration of a request.
+   * Returns a release function; it is idempotent so the gateway can safely call
+   * it from every exit path (success, failure, client disconnect).
+   *
+   * Capacity is checked at PICK time, so the reservation itself always
+   * succeeds — a request that was already routed must never be dropped because
+   * a sibling request filled the last slot in between.
+   */
+  reserve(exitId: string, model: string): () => void {
+    const health = this.#health.get(exitId)
+    if (!health) return () => {}
+    const key = this.#banKey(exitId, model)
+    health.inflightByModel.set(key, (health.inflightByModel.get(key) ?? 0) + 1)
+    health.inflightTotal += 1
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      const current = health.inflightByModel.get(key) ?? 0
+      if (current <= 1) health.inflightByModel.delete(key)
+      else health.inflightByModel.set(key, current - 1)
+      health.inflightTotal = Math.max(0, health.inflightTotal - 1)
+    }
+  }
+
+  /** Live in-flight count for one exit (diagnostics / tests). */
+  inflightOf(exitId: string): number {
+    return this.#health.get(exitId)?.inflightTotal ?? 0
+  }
+
+  /**
+   * Distinct egress identities among the currently usable exits.
+   *
+   * The free lane meters quota PER EGRESS IP, so two exit slots that leave
+   * through the same IP share ONE budget (measured 2026-10-22: 10808 and 21006
+   * both egressed at 47.131.86.109, and both 429'd in the same second once that
+   * budget ran out). Counting slots overstates capacity and — worse — makes the
+   * rotation budget believe there are more chances than there really are.
+   *
+   * An exit with no measured `exitIP` yet is identified by its own id: unknown
+   * is not the same as shared.
+   */
+  distinctEgressCount(model: string): number {
+    const seen = new Set<string>()
+    for (const node of this.#exits.values()) {
+      if (!this.isUsable(node.id, model)) continue
+      seen.add(this.#egressKey(node))
+    }
+    return seen.size
+  }
+
+  /** Identity of the egress IP behind an exit (its own id until measured). */
+  #egressKey(node: ExitNode): string {
+    return node.exitIP ? `ip:${node.exitIP}` : `id:${node.id}`
+  }
+
+  /**
+   * Collapse candidates to ONE representative per egress IP, preferring the
+   * pinned exit then the lowest latency. Without this, round-robin spreads
+   * fresh sessions across slots that share an IP and burns that single budget
+   * several times faster than it would with genuinely distinct exits.
+   */
+  #dedupeByEgress(candidates: ExitNode[]): ExitNode[] {
+    const best = new Map<string, ExitNode>()
+    for (const node of candidates) {
+      const key = this.#egressKey(node)
+      const current = best.get(key)
+      if (!current) {
+        best.set(key, node)
+        continue
+      }
+      const better =
+        (node.pinned && !current.pinned) ||
+        (node.pinned === current.pinned &&
+          (node.latencyMs || Number.MAX_SAFE_INTEGER) < (current.latencyMs || Number.MAX_SAFE_INTEGER))
+      if (better) best.set(key, node)
+    }
+    return [...best.values()]
   }
 
   /** A ban is active unless it has aged out past banTtlMs. Expired bans are
@@ -274,6 +419,13 @@ export class ExitPool {
         // become the emergency candidate either — that would reintroduce the
         // connect-timeout tax precisely when the pool is already starved.
         if (health.state === 'unknown' && n.source === 'free') return false
+        // A quota cool-down means the upstream told us when this egress becomes
+        // usable again. Sampling it before that is a guaranteed 429 on every
+        // request — the relief tier exists for "maybe a blip", not "known dead
+        // until 07:40 tomorrow". Transport and gate cool-downs stay eligible.
+        if (health.cooldownReason === 'limited' && health.cooldownUntil > this.#now()) {
+          if (health.cooldownUntil - this.#now() > QUOTA_RESET_GRACE_MS) return false
+        }
         return health.cooldownUntil <= this.#now()
       })
     }
@@ -293,6 +445,12 @@ export class ExitPool {
         if (health.state === 'unknown' && n.source === 'free') return false
         const remaining = health.cooldownUntil - now
         if (remaining <= 0 || remaining > STARVED_COOLDOWN_BUDGET_MS) return false
+        // A quota cool-down is NOT a precautionary one: the upstream told us
+        // exactly when its window resets (measured 2026-10-22: ~7.4h), so
+        // sampling inside that grace window is a guaranteed 429 plus the
+        // round-trip. Only genuine blips (transport / gate cooldowns, raised
+        // without a reset time) are worth a gamble.
+        if (health.cooldownReason === 'limited' && remaining > QUOTA_RESET_GRACE_MS) return false
         // An identity-gate verdict for this exit×model does not expire on its
         // own clock — that class is what the model-ban relief above relieves.
         const ban = this.#bans.get(this.#banKey(n.id, model))
@@ -311,6 +469,9 @@ export class ExitPool {
       if (la !== lb) return la - lb
       return b.addedAt - a.addedAt
     })
+    // One slot per egress IP: aliases of the same IP share a single quota, so
+    // cycling across them buys nothing but burns that quota faster.
+    candidates = this.#dedupeByEgress(candidates)
     // Round-robin across ALL usable candidates, not just a latency top tier.
     // The free lane meters quota per egress IP, so letting every fresh session
     // pile onto the lowest-latency exit (the old behavior) exhausted that one
@@ -349,8 +510,15 @@ export class ExitPool {
   }
 
   /** Record a failure against an exit; returns whether other exits remain
-   *  usable for the model (rotate feasibility). */
-  markFailure(exitId: string, model: string, kind: FailureKind): void {
+   *  usable for the model (rotate feasibility).
+   *
+   *  `retryAfterMs` is the upstream's own reset time for this verdict (only
+   *  meaningful for a quota 429). Credit it instead of the default cooldown:
+   *  the free lane's window resets in HOURS, and re-sampling a burned egress
+   *  every 60 seconds is how a "rotation" turns into a stream of guaranteed
+   *  429s. The configured cooldownMs remains the floor, and maxCooldownMs the
+   *  ceiling, so a missing or absurd header degrades to the old behaviour. */
+  markFailure(exitId: string, model: string, kind: FailureKind, retryAfterMs?: number): void {
     const health = this.#health.get(exitId)
     if (!health) return
     const now = this.#now()
@@ -361,6 +529,12 @@ export class ExitPool {
         const factor = Math.min(2 ** (health.consecutiveLimited - 1), 10)
         health.cooldownUntil = now + this.#cooldownMs * factor
         health.cooldownReason = 'limited'
+        // The upstream's reset time outranks the local backoff math: it is the
+        // only value that actually describes when this egress becomes usable.
+        if (this.#honorRetryAfter && retryAfterMs !== undefined && retryAfterMs > 0) {
+          const windowMs = Math.min(Math.max(retryAfterMs, this.#cooldownMs), this.#maxCooldownMs)
+          health.cooldownUntil = Math.max(health.cooldownUntil, now + windowMs)
+        }
         break
       }
       case 'transport': {
@@ -525,6 +699,8 @@ export class ExitPool {
           state: health.state,
           cooling: health.cooldownUntil > now,
           cooldownRemainingMs: Math.max(0, health.cooldownUntil - now),
+          inflight: health.inflightTotal,
+          lastProbedAgoMs: health.lastProbedAt > 0 ? now - health.lastProbedAt : 0,
         }
       })
   }
@@ -534,6 +710,20 @@ export class ExitPool {
     let n = 0
     for (const node of this.#exits.values()) if (this.isUsable(node.id, model)) n += 1
     return n
+  }
+
+  /** Milliseconds until the EARLIEST cooling exit becomes usable again, or 0
+   *  when nothing is cooling. Used to tell a caller how long a quota-exhausted
+   *  pool needs before a retry can possibly succeed. */
+  nextCooldownExpiryMs(): number {
+    const now = this.#now()
+    let soonest = 0
+    for (const health of this.#health.values()) {
+      const remaining = health.cooldownUntil - now
+      if (remaining <= 0) continue
+      if (soonest === 0 || remaining < soonest) soonest = remaining
+    }
+    return soonest
   }
 
   #banModel(exitId: string, model: string, immediate: boolean): void {

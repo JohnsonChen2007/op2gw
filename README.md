@@ -188,11 +188,15 @@ HOME=/tmp/oc-home opencode run -m opencode/big-pickle hello
 
 ### 多出口 IP 池：两层健康 + 轮换重试
 
-默认关闭（纯直连）；`--pool` 开启。出口来源：手填明文代理 + 免费源抓取（带断路器）+ 固定主力(pinned)。
+默认关闭（纯直连）；`--pool` 开启。出口来源：手填明文代理 + 免费源抓取（带断路器，默认关闭）+ 固定主力(pinned)。
 
 - **两层健康**（`pool/pool.ts`）：
   - **Tier 1 per-exit**：429 冷却**整个出口**（配额按出口 IP 计）+ 传输失败标记 dead；冷却按连续次数指数退避。
   - **Tier 2 per-(出口×模型)**：401/403/地区封锁通常是**模型级**（如 muse 的 RegionError），只封禁该「出口×模型」配对，出口服务其他模型不受影响。
+- **配额冷却对齐上游真实重置时间**（2026-10-22 实测）：免费层对耗尽出口返回 `429 FreeUsageLimitError` + `retry-after: 26843~26851`（**≈7.4 小时**）。网关此前只做本地 60s 退避，于是每小时都在重撞一个未来 7 小时都不会答应的 IP。现在 `markFailure` 接收上游 `retry-after`，冷却取下限 `cooldownMs`、上限 `maxCooldownMs`，配额冷却也不再进入「池饥饿时采样短冷却出口」的兜底分支（那分支只留给传输抖动）。
+- **一个出口 IP 只算一个出口**：节点地址 ≠ 出口 IP。实测 `10808` 与 `21006` 同时出网于 `47.131.86.109`，该 IP 配额一耗尽两者同秒一起 429。`pick()` 现按 `exitIP` 去重（同 IP 只取一个代表，优先 pinned、再低延迟），轮换预算也据此计数；`scripts/xray-pool.mjs gen --dedupe-egress` 可在生成 sidecar 时按实测出口 IP 收敛端口。
+- **轮换有墙钟上限**：轮流重试次数按**可用独立出口**数计算（不再是含 dead/冷却的总数），并受 `rotateBudgetMs`（默认 45s）约束。此前 25 个槽位的脏池会让单个请求最多试 25 个出口、每个耗 6s 连接超时，最坏 150 秒才报错。
+- **每出口并发上限**（`maxInflightPerExit`，默认 4）：长流不会把同一个 IP 的配额瞬间抽干；预留槽位幂等释放，成功、失败、客户端断开三条路径都会归还。
 - **选择顺序**：pinned 固定出口 → 会话粘性（同对话粘同出口，保 prompt-cache）→ 最优健康节点（低延迟优先）。
 - **轮换重试**（`gateway/gateway.ts`）：一次客户端请求内，若流在**任何内容落地之前**失败，网关透明换一个健康出口重发（有上限）；一旦有字节流出就停止轮换（已交付的流绝不重放）。
 - **后台探活**（`pool/prober.ts`）：多站点可达性验证——先探网关自己的上游 `GET {zen}/v1/models`（出口能服务推理流量即为活），再试 Google 204 / YouTube / ipify（拿真实出口 IP，兼作路由键与展示值）。**任何 HTTP 应答（含 404/429/5xx）都证明隧道可用**，只有传输层错误（连接超时/重置/中止）才算失败——部分代理线路会硬重置 Google/YouTube（实测 2026-10-02：两条远程出口 ~0.3s 内 RST 所有 Google 连接而 opencode.ai 正常），仅靠通用站点判活会把健康出口误杀。全部站点失败才标记 dead；请求路径的传输失败只做短期冷却，死活判定权归探活的异地多站点验证。长期 dead 的免费节点被淘汰，手动出口永不淘汰（可被后续探活复活）。
@@ -252,6 +256,13 @@ HOME=/tmp/oc-home opencode run -m opencode/big-pickle hello
 | `pool.includeDirect` | `OP2GW_POOL_INCLUDE_DIRECT` | `true` | `false` = 出口只走代理，直连仅作最后手段 |
 | `pool.manual` | `OP2GW_POOL_MANUAL` | `[]` | `http://h:p`、`socks5://h:p` |
 | `pool.freeSources` | `OP2GW_POOL_FREE_SOURCES` | `[]` | 免费代理清单 URL（纯文本，每行一个） |
+| `pool.freeTargetSize` | `OP2GW_POOL_FREE_TARGET` | `0` | 免费池目标规模；`0` = 关闭。公开清单对 opencode.ai 实测 0 存活（2026-10-22），默认不再启用 |
+| `pool.maxRotateAttempts` | `OP2GW_POOL_MAX_ROTATE` | `3` | 单请求内最少轮换次数（实际按**可用独立出口**数上浮） |
+| `pool.rotateBudgetMs` | `OP2GW_POOL_ROTATE_BUDGET_MS` | `45000` | 轮换循环的**墙钟**上限；超出即停止轮换并回最后一个真实上游错误，`0` 关闭 |
+| `pool.honorRetryAfter` | `OP2GW_POOL_HONOR_RETRY_AFTER` | `true` | 用上游 `Retry-After` 作为该出口的配额冷却（免费层窗口以**小时**计） |
+| `pool.cooldownMs` | `OP2GW_POOL_COOLDOWN_MS` | `60000` | 冷却下限（传输失败用此值） |
+| `pool.maxCooldownMs` | `OP2GW_POOL_MAX_COOLDOWN_MS` | `8h` | 单次冷却上限，防异常头把出口停到很久以后 |
+| `pool.maxInflightPerExit` | `OP2GW_POOL_MAX_INFLIGHT` | `4` | 每出口并发上限，`0` 不限；避免单个出口 IP 的配额被长流瞬间抽干 |
 | `pool.pinnedExitId` | `OP2GW_POOL_PINNED` | `` | 固定主力出口 |
 | `proxy` | `OP2GW_PROXY` | 自动检测 | 默认出口代理；留空直连，`--proxy`/`--no-proxy` |
 
@@ -277,9 +288,10 @@ op2gw 首次启动时**自动从环境变量采集本机代理**（`https_proxy`
   "pool": {
     "enabled": true,
     "manual": ["socks5://127.0.0.1:1080"],
-    "freeSources": ["https://example.com/http-proxies.txt"],
-    "freeTargetSize": 20,
-    "maxRotateAttempts": 3
+    "maxRotateAttempts": 3,
+    "rotateBudgetMs": 45000,
+    "honorRetryAfter": true,
+    "maxInflightPerExit": 4
   }
 }
 ```

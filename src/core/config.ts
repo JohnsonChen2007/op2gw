@@ -72,12 +72,33 @@ export interface PoolConfig {
   includeDirect: boolean
   /** Free public-proxy source lists (raw text URLs, http:// or socks5:// lines). */
   freeSources: string[]
-  /** Target size for the auto-fetched free pool. */
+  /** Target size for the auto-fetched free pool. 0 = disabled (default). */
   freeTargetSize: number
   /** Max rotate attempts inside one client request (pre-content failures). */
   maxRotateAttempts: number
-  /** Per-exit 429 cooldown (ms). */
+  /**
+   * Wall-clock ceiling (ms) for the whole rotation loop. Attempt count alone
+   * cannot bound latency: each attempt on a half-dead exit costs a connect
+   * timeout, so a dirty pool could hold a request for minutes before erroring.
+   * 0 disables. Default 45s.
+   */
+  rotateBudgetMs: number
+  /**
+   * Credit the upstream's `Retry-After` towards an exit's quota cooldown.
+   * Zen resets a free-lane window in HOURS; ignoring the header re-samples a
+   * burned egress all day. Default true.
+   */
+  honorRetryAfter: boolean
+  /** Ceiling on any single Retry-After-derived cooldown (ms). Default 8h. */
+  maxCooldownMs: number
+  /** Per-exit 429 cooldown (ms), used as the floor and for transport failures. */
   cooldownMs: number
+  /**
+   * Max concurrent in-flight requests per exit (0 = unlimited). The free lane
+   * meters quota per egress IP, so one IP's budget lasts longer when a burst
+   * of long streams cannot pile onto it. Default 4.
+   */
+  maxInflightPerExit: number
   /** Auto-expire an exit×model ban after this many ms (prevents a transient
    *  refusal from permanently stranding the pairing). */
   banTtlMs: number
@@ -104,6 +125,10 @@ export function defaultConfig(): Op2gwConfig {
     zenBaseUrl: 'https://opencode.ai/inference',
     zenApiKey: '',
     metadataUrl: 'https://models.dev/api.json',
+    // The upstream moves fast (2026-10: the lane migrated /zen -> /inference and
+    // its UA window narrowed twice). A day-long catalog would keep advertising
+    // models that moved dialect or delisted; 5 minutes tracks it at negligible
+    // cost, and the refresh is already single-flight + cached.
     refreshSeconds: 300,
     // Generous: this only has to be shorter than "forever". A non-streaming
     // turn legitimately takes minutes, so 10 minutes bounds a hung upstream
@@ -117,10 +142,19 @@ export function defaultConfig(): Op2gwConfig {
       manual: [],
       pinnedExitId: '',
       includeDirect: true,
+      // Off by default: public proxy lists had a 0% hit rate against
+      // opencode.ai in the 2026-10-22 measurement (8/8 admitted free exits
+      // dead), while every dead slot still costs a probe round and a
+      // connect-timeout slot on the request path. Exits should come from a
+      // node library that is actually reachable (see scripts/xray-pool.mjs).
       freeSources: [],
-      freeTargetSize: 20,
+      freeTargetSize: 0,
       maxRotateAttempts: 3,
+      rotateBudgetMs: 45_000,
+      honorRetryAfter: true,
+      maxCooldownMs: 8 * 60 * 60_000,
       cooldownMs: 60_000,
+      maxInflightPerExit: 4,
       // A region/model refusal is often transient or egress-dependent, so a ban
       // must expire on its own; otherwise one bad exit×model sample strands the
       // pairing until restart. 10 minutes matches the cooldown scale.
@@ -209,6 +243,13 @@ export async function loadConfig(argv: string[] = process.argv.slice(2)): Promis
   if (manual) cfg.pool.manual = manual
   const freeSources = splitList(env.OP2GW_POOL_FREE_SOURCES)
   if (freeSources) cfg.pool.freeSources = freeSources
+  cfg.pool.freeTargetSize = coerceNum(env.OP2GW_POOL_FREE_TARGET, cfg.pool.freeTargetSize)
+  cfg.pool.maxRotateAttempts = coerceNum(env.OP2GW_POOL_MAX_ROTATE, cfg.pool.maxRotateAttempts)
+  cfg.pool.rotateBudgetMs = coerceNum(env.OP2GW_POOL_ROTATE_BUDGET_MS, cfg.pool.rotateBudgetMs)
+  cfg.pool.cooldownMs = coerceNum(env.OP2GW_POOL_COOLDOWN_MS, cfg.pool.cooldownMs)
+  cfg.pool.maxCooldownMs = coerceNum(env.OP2GW_POOL_MAX_COOLDOWN_MS, cfg.pool.maxCooldownMs)
+  cfg.pool.maxInflightPerExit = coerceNum(env.OP2GW_POOL_MAX_INFLIGHT, cfg.pool.maxInflightPerExit)
+  cfg.pool.honorRetryAfter = coerceBool(env.OP2GW_POOL_HONOR_RETRY_AFTER, cfg.pool.honorRetryAfter)
   cfg.pool.pinnedExitId = env.OP2GW_POOL_PINNED ?? cfg.pool.pinnedExitId
   cfg.pool.includeDirect = coerceBool(env.OP2GW_POOL_INCLUDE_DIRECT, cfg.pool.includeDirect)
 

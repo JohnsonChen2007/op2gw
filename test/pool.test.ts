@@ -395,3 +395,145 @@ test('the cool-down relief never overrides an identity-gate ban', () => {
     'the same exit is still worth sampling for a model the gate never judged',
   )
 })
+
+// ---------------------------------------------------------------------------
+// Quota alignment (2026-10-22): the free lane meters per egress IP and answers
+// an exhausted one with a 429 whose Retry-After is the real window reset.
+// ---------------------------------------------------------------------------
+
+test('a quota 429 credits the upstream Retry-After instead of the local backoff', () => {
+  let now = 1_000_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://q:1'))
+  // Measured upstream value: 26851s ~ 7.46h.
+  const retryAfterMs = 26_851_000
+  pool.markFailure('http://q:1', 'm', 'limited', retryAfterMs)
+  assert.equal(pool.isUsable('http://q:1', 'm'), false)
+
+  // A minute later it must STILL be unusable — the whole point: the old code
+  // re-sampled it every 60s for the entire 7-hour window.
+  now += 61_000
+  assert.equal(pool.isUsable('http://q:1', 'm'), false, 'a 60s local cooldown must not expire a 7h quota window')
+
+  // And it comes back only after the announced reset.
+  now += retryAfterMs
+  assert.equal(pool.isUsable('http://q:1', 'm'), true)
+})
+
+test('the Retry-After floor is cooldownMs and the ceiling is maxCooldownMs', () => {
+  let now = 0
+  const pool = new ExitPool({ cooldownMs: 60_000, maxCooldownMs: 120_000, now: () => now })
+  pool.add(node('http://tiny:1'))
+  // A nonsense 1s header must not shorten the precautionary cooldown.
+  pool.markFailure('http://tiny:1', 'm', 'limited', 1_000)
+  now = 60_000 - 1
+  assert.equal(pool.isUsable('http://tiny:1', 'm'), false, 'the configured cooldown is the floor')
+  now = 60_001
+  assert.equal(pool.isUsable('http://tiny:1', 'm'), true)
+
+  const capped = new ExitPool({ cooldownMs: 1_000, maxCooldownMs: 120_000, now: () => now })
+  capped.add(node('http://huge:1'))
+  // An absurd header must not bench the exit for days.
+  capped.markFailure('http://huge:1', 'm', 'limited', 86_400_000)
+  now += 120_000 - 1
+  assert.equal(capped.isUsable('http://huge:1', 'm'), false, 'capped cooldown still applies')
+  now += 2
+  assert.equal(capped.isUsable('http://huge:1', 'm'), true, 'the ceiling bounds even a hostile header')
+})
+
+test('honorRetryAfter=false restores the plain exponential backoff', () => {
+  let now = 0
+  const pool = new ExitPool({ cooldownMs: 60_000, honorRetryAfter: false, now: () => now })
+  pool.add(node('http://old:1'))
+  pool.markFailure('http://old:1', 'm', 'limited', 26_851_000)
+  now += 60_001
+  assert.equal(pool.isUsable('http://old:1', 'm'), true, 'opt-out keeps the legacy 60s behaviour')
+})
+
+test('a long quota cool-down is never sampled, while a transport blip still is', () => {
+  // Real clock base: a 0-based fake clock cannot tell "no cooldown" (0) from
+  // "cooled until epoch" (0), which is a test artefact, not pool behaviour.
+  let now = 1_000_000
+  const pool = new ExitPool({ cooldownMs: 60_000, now: () => now })
+  pool.add(node('http://burnt:1'))
+  // The measured upstream reset (~7.4h) must survive the starved relief.
+  pool.markFailure('http://burnt:1', 'm', 'limited', 26_851_000)
+  assert.equal(pool.isUsable('http://burnt:1', 'm'), false)
+  assert.equal(pool.pick('m', 'sess-1'), null, 'a known quota reset must not be gambled against')
+
+  // A transport blip is a different verdict: reachability is unknown, not
+  // refused, so a starved pool may still spend one attempt on it.
+  const blip = new ExitPool({ cooldownMs: 120_000, now: () => now })
+  blip.add(node('http://blip:1'))
+  blip.markFailure('http://blip:1', 'm', 'transport')
+  assert.equal(blip.isUsable('http://blip:1', 'm'), false)
+  assert.ok(blip.pick('m', 'sess-2'), 'a short transport cool-down is worth one gamble')
+
+  // Once the announced quota window passes, the exit is selectable again.
+  now += 26_851_000 + 1
+  assert.equal(pool.pick('m', 'sess-3')?.exit.id, 'http://burnt:1')
+})
+
+test('distinctEgressCount collapses exits that share an egress IP', () => {
+  const pool = new ExitPool()
+  pool.add(node('http://a:1'))
+  pool.add(node('http://b:1'))
+  pool.add(node('socks5://c:1'))
+  // Measured 2026-10-22: 10808 and 21006 both exited at 47.131.86.109.
+  pool.markProbe('http://a:1', true, 100, '47.131.86.109')
+  pool.markProbe('http://b:1', true, 120, '47.131.86.109')
+  pool.markProbe('socks5://c:1', true, 140, '3.70.46.36')
+  assert.equal(pool.usableCount('m'), 3, 'three slots are usable')
+  assert.equal(pool.distinctEgressCount('m'), 2, 'but only two of them buy a distinct quota')
+})
+
+test('pick spreads sessions across distinct egress IPs, not aliases of one', () => {
+  const pool = new ExitPool()
+  pool.add(node('http://a:1', { latencyMs: 50 }))
+  pool.add(node('http://b:1', { latencyMs: 60 }))
+  pool.add(node('socks5://c:1', { latencyMs: 90 }))
+  // a and b are the same physical egress.
+  pool.markProbe('http://a:1', true, 50, '47.131.86.109')
+  pool.markProbe('http://b:1', true, 60, '47.131.86.109')
+  pool.markProbe('socks5://c:1', true, 90, '3.70.46.36')
+
+  const seen = new Set<string>()
+  for (let i = 0; i < 8; i += 1) {
+    const picked = pool.pick('m', `sess-${i}`)
+    assert.ok(picked)
+    seen.add(picked!.exit.exitIP)
+  }
+  assert.deepEqual([...seen].sort(), ['3.70.46.36', '47.131.86.109'], 'a session never lands on an alias of the same IP')
+})
+
+test('per-exit in-flight cap keeps new requests off a saturated egress', () => {
+  const pool = new ExitPool({ maxInflightPerExit: 2 })
+  pool.add(node('http://a:1'))
+  pool.add(node('http://b:1'))
+
+  const releaseA1 = pool.reserve('http://a:1', 'm')
+  const releaseA2 = pool.reserve('http://a:1', 'm')
+  assert.equal(pool.inflightOf('http://a:1'), 2)
+  assert.equal(pool.isUsable('http://a:1', 'm'), false, 'a full exit is not a candidate')
+  const picked = pool.pick('m', 'sess-1')
+  assert.equal(picked?.exit.id, 'http://b:1', 'traffic moves to the exit with headroom')
+
+  releaseA1()
+  releaseA1() // idempotent
+  assert.equal(pool.inflightOf('http://a:1'), 1, 'a double release must not under-count')
+  assert.equal(pool.isUsable('http://a:1', 'm'), true)
+  releaseA2()
+  assert.equal(pool.inflightOf('http://a:1'), 0)
+})
+
+test('reserve never rejects a request that was already routed', () => {
+  const pool = new ExitPool({ maxInflightPerExit: 1 })
+  pool.add(node('http://a:1'))
+  pool.reserve('http://a:1', 'm')
+  // The pool may fill up between pick() and reserve(); the reservation must
+  // still succeed or the request would be dropped after being routed.
+  const release = pool.reserve('http://a:1', 'm')
+  assert.equal(pool.inflightOf('http://a:1'), 2)
+  release()
+  assert.equal(pool.inflightOf('http://a:1'), 1)
+})

@@ -103,8 +103,14 @@ test('parseRetryAfter reads delta-seconds and HTTP-dates, and caps both', () => 
   const at = new Date(now + 30_000).toUTCString()
   assert.equal(parseRetryAfter(at, now), 30_000, 'HTTP-date form')
 
-  // A hostile value must not park an exit in cooldown for hours.
-  assert.equal(parseRetryAfter('999999'), 5 * 60_000)
+  // Zen's free-lane quota window resets in HOURS (measured 26843-26851s). The
+  // old 5-minute cap truncated that to 300s, so the pool believed a burned
+  // egress was usable again minutes later — every rotation in between was a
+  // doomed 429.
+  assert.equal(parseRetryAfter('26851'), 26_851_000, 'a multi-hour quota reset survives parsing')
+
+  // A hostile value must still not park an exit in cooldown for weeks.
+  assert.equal(parseRetryAfter('999999999'), 24 * 60 * 60_000)
 })
 
 test('wrapDeadline returns the source untouched when the budget is disabled', () => {

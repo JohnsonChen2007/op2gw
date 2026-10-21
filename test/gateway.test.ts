@@ -74,8 +74,8 @@ function sse(status: number, body: string, res: ServerResponse): void {
   res.end(body)
 }
 
-function json(status: number, body: unknown, res: ServerResponse): void {
-  res.writeHead(status, { 'content-type': 'application/json' })
+function json(status: number, body: unknown, res: ServerResponse, headers: Record<string, string> = {}): void {
+  res.writeHead(status, { 'content-type': 'application/json', ...headers })
   res.end(JSON.stringify(body))
 }
 
@@ -126,6 +126,7 @@ function makeGateway(
     freeModels?: string[]
     onPoolStarved?: () => void
     bodyBudgetMs?: number
+    rotateBudgetMs?: number
   } = { poolEnabled: false },
 ): GatewayHarness {
   const logger = new Logger({ level: 'error', stdout: false, capacity: 50, traceCapacity: 50 })
@@ -165,6 +166,7 @@ function makeGateway(
     getApiKey: () => '',
     onPoolStarved: opts.onPoolStarved,
     bodyBudgetMs: opts.bodyBudgetMs,
+    rotateBudgetMs: opts.rotateBudgetMs,
   })
   const cleanup = async (): Promise<void> => {
     await dispatchers.destroy().catch(() => {})
@@ -609,4 +611,93 @@ test('a cooled gate verdict keeps the next request off that exit', async () => {
   })
   await collect(r1.body)
   assert.equal(r1.trace.exit, 'http://e2:1', 'the gated exit is skipped, rotation lands on the healthy one')
+})
+
+// ---------------------------------------------------------------------------
+// Rotation budget & quota diagnostics (2026-10-22)
+// ---------------------------------------------------------------------------
+
+test('a wall-clock budget stops the rotation instead of trying every slot', async () => {
+  // Every exit 429s after a short delay. With five exits and a 150ms budget,
+  // the loop must stop on TIME rather than burn five attempts: attempt count
+  // alone let a dirty pool hold a request for attempt-count x connect timeout.
+  const { url, seen } = await startZen((_seen, res) => {
+    setTimeout(() => json(429, { error: { message: 'slow down' } }, res), 80)
+  })
+  const { gateway } = makeGateway(url, {
+    poolEnabled: true,
+    exits: ['http://e1:1', 'http://e2:1', 'http://e3:1', 'http://e4:1', 'http://e5:1'],
+    maxRotateAttempts: 5,
+    rotateBudgetMs: 150,
+  })
+  await assert.rejects(
+    gateway.handle({ api: 'chat', body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] }, clientStream: true }),
+    (err: unknown) => err instanceof GatewayHttpError && err.status === 429,
+  )
+  assert.ok(seen.length >= 1, 'at least the first attempt ran')
+  assert.ok(seen.length < 5, `the budget stopped the loop early (attempts=${seen.length})`)
+})
+
+test('a pool-wide 429 reports when the earliest quota window reopens', async () => {
+  const { url } = await startZen((_seen, res) =>
+    json(429, { error: { message: 'Rate limit exceeded' } }, res, { 'retry-after': '600' }),
+  )
+  const { gateway } = makeGateway(url, {
+    poolEnabled: true,
+    exits: ['http://q-a:1', 'http://q-b:1'],
+    maxRotateAttempts: 1,
+  })
+  await assert.rejects(
+    gateway.handle({ api: 'chat', body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] }, clientStream: true }),
+    (err: unknown) =>
+      err instanceof GatewayHttpError &&
+      err.status === 429 &&
+      /quota/i.test(err.message) &&
+      /reopens in \d+ min/.test(err.message),
+  )
+})
+
+test('a saturated exit is skipped while another has headroom', async () => {
+  const { url, seen } = await startZen((_seen, res) => sse(200, chatSse(CHAT_MODEL, 'ok'), res))
+  const { gateway, pool } = makeGateway(url, {
+    poolEnabled: true,
+    exits: ['http://busy:1', 'http://free:1'],
+  })
+  // Saturate the first exit exactly as concurrent in-flight requests would.
+  const max = pool.maxInflightPerExit
+  const releases = Array.from({ length: max }, () => pool.reserve('http://busy:1', CHAT_MODEL))
+  const result = await gateway.handle({
+    api: 'chat',
+    body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+    clientStream: true,
+  })
+  assert.equal(result.trace.exit, 'http://free:1', 'the saturated exit is not a candidate')
+  await collect(result.body)
+  // The gateway released its own slot: the pool must not leak reservations.
+  assert.equal(pool.inflightOf('http://free:1'), 0, 'the in-flight slot is released after the turn')
+  assert.equal(seen.length, 1)
+  for (const release of releases) release()
+  assert.equal(pool.inflightOf('http://busy:1'), 0)
+})
+
+test('rotateBudgetMs=0 disables the wall-clock cap instead of blocking rotation', async () => {
+  let hits = 0
+  const { url, seen } = await startZen((_seen, res) => {
+    hits += 1
+    if (hits === 1) json(429, { error: { message: 'slow down' } }, res)
+    else sse(200, chatSse(CHAT_MODEL, 'second exit'), res)
+  })
+  const { gateway } = makeGateway(url, {
+    poolEnabled: true,
+    exits: ['http://x1:1', 'http://x2:1'],
+    maxRotateAttempts: 2,
+    rotateBudgetMs: 0,
+  })
+  const result = await gateway.handle({
+    api: 'chat',
+    body: { model: CHAT_MODEL, messages: [{ role: 'user', content: 'hi' }] },
+    clientStream: true,
+  })
+  assert.equal(result.trace.attempts, 2)
+  assert.equal(seen.length, 2, 'rotation still runs when the cap is explicitly disabled')
 })

@@ -68,7 +68,14 @@ export function isIdentityGate(err: unknown): boolean {
  * Parse a `Retry-After` header into milliseconds. Accepts both forms the spec
  * allows (delta-seconds and an HTTP-date), returns undefined when absent or
  * unparseable, and caps the result so a hostile/absurd value cannot park an
- * exit in cooldown for hours.
+ * exit in cooldown for days.
+ *
+ * The cap is deliberately generous. Zen's free-lane quota window resets in
+ * HOURS (measured 2026-10-22: `retry-after: 26843-26851`, ~7.4h), so the old
+ * 5-minute ceiling silently truncated the only value that described reality —
+ * the pool then believed a burned egress was usable again 5 minutes later, and
+ * every rotation in between was a guaranteed 429. The pool separately applies
+ * its own `maxCooldownMs` (default 8h), so this is only a sanity bound.
  */
 export function parseRetryAfter(value: string | string[] | undefined, now = Date.now()): number | undefined {
   if (value === undefined) return undefined
@@ -85,7 +92,10 @@ export function parseRetryAfter(value: string | string[] | undefined, now = Date
   return delta > 0 ? Math.min(delta, RETRY_AFTER_CAP_MS) : undefined
 }
 
-const RETRY_AFTER_CAP_MS = 5 * 60_000
+/** Sanity ceiling for `Retry-After` (24h). The pool's own maxCooldownMs is the
+ *  operational limit; this only stops an absurd header parking an exit for
+ *  weeks. */
+const RETRY_AFTER_CAP_MS = 24 * 60 * 60_000
 
 export function classifyStatus(status: number, bodyHint = ''): FailureKind {
   if (status === 429) return 'limited'
