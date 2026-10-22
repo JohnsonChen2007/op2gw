@@ -6,6 +6,7 @@ import { opencodeUserAgent } from '../core/ids.js'
 import { ANONYMOUS_KEY } from '../core/freelane.js'
 import type { FreeDecision } from '../core/types.js'
 import { fallbackFreeModels, verifiedFreeModels, disabledModels, contextWindowOverrides, maxOutputOverride } from './static-models.js'
+import { ModelHealth } from './model-health.js'
 
 /**
  * Model catalog with the S1/S2/S3 fallback chain.
@@ -61,6 +62,14 @@ export interface CatalogOptions {
   /** Per-request deadline for the S1/S2 fetches. Default 30s. */
   fetchTimeoutMs?: number
   onRefresh?: (snapshot: CatalogSnapshot) => void
+  /**
+   * Consecutive upstream `server` failures (across exits, i.e. model-level)
+   * before the id is hidden from `GET /v1/models`. 0 disables auto-hiding.
+   * Default 5.
+   */
+  hideAfterFailures?: number
+  /** How long an auto-hidden model stays hidden before being re-advertised (ms). Default 5min. */
+  hideForMs?: number
 }
 
 export function isFreeByName(model: string): boolean {
@@ -187,6 +196,13 @@ export class ModelCatalog {
   #lastError = ''
   #timer: NodeJS.Timeout | null = null
   #stopped = false
+  /**
+   * Model-level liveness. Unlike `disabledModels` (build-time, permanent, global
+   * to the artifact) this is runtime, per-process, and self-healing: a model the
+   * upstream keeps failing is hidden from `GET /v1/models` for a while so
+   * clients stop picking it, then re-advertised so the upstream gets re-probed.
+   */
+  readonly #health: ModelHealth
   readonly #opts: Required<Pick<CatalogOptions, 'zenBaseUrl' | 'metadataUrl' | 'refreshSeconds' | 'cachePath' | 'logger'>> & CatalogOptions
   readonly #fetch: typeof fetch
   readonly #now: () => number
@@ -199,6 +215,16 @@ export class ModelCatalog {
     this.#now = options.now ?? Date.now
     this.#staleMs = options.staleMs ?? 10 * 60_000
     this.#fetchTimeoutMs = options.fetchTimeoutMs ?? FETCH_TIMEOUT_MS
+    this.#health = new ModelHealth({
+      failThreshold: options.hideAfterFailures,
+      ttlMs: options.hideForMs,
+      now: options.now,
+    })
+  }
+
+  /** Model-level failure/success signals, owned here so `list()` can honour them. */
+  get health(): ModelHealth {
+    return this.#health
   }
 
   async start(): Promise<void> {
@@ -314,13 +340,17 @@ export class ModelCatalog {
    * Ids exposed to clients: every in-sale model that is free, computed live
    * from the current S1 x S2 verdicts. Falls back to the verified bootstrap
    * list only while S1 has never produced a list (cold start / upstream down).
-   * Permanently broken/dead models are explicitly filtered out.
+   * Permanently broken/dead models are explicitly filtered out, and so are
+   * models currently auto-hidden by `ModelHealth` (consecutive upstream server
+   * failures). Hiding is temporary — see `ModelHealth` — so an id the upstream
+   * only failed briefly comes back on its own without a redeploy.
    */
   list(): string[] {
-    if (this.#zen.size === 0) return [...verifiedFreeModels].filter((m) => !disabledModels.includes(m))
+    const visible = (model: string): boolean => !disabledModels.includes(model) && !this.#health.isHidden(model)
+    if (this.#zen.size === 0) return [...verifiedFreeModels].filter(visible)
     const out: string[] = []
     for (const model of this.#zen) {
-      if (!disabledModels.includes(model) && this.decision(model).allowed) {
+      if (visible(model) && this.decision(model).allowed) {
         out.push(model)
       }
     }

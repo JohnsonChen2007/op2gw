@@ -56,6 +56,8 @@ export interface Op2gwConfig {
   pool: PoolConfig
   /** Self-healing settings. */
   selfHeal: SelfHealConfig
+  /** Runtime model visibility (auto-hide after repeated upstream failures). */
+  modelVisibility: ModelVisibilityConfig
 }
 
 export interface PoolConfig {
@@ -117,6 +119,27 @@ export interface SelfHealConfig {
   deadEvictions: number
 }
 
+/**
+ * Runtime model visibility policy.
+ *
+ * Some ids are broken at the upstream for one region while working fine in
+ * another (measured 2026-10-22: `flint-40b-free` 503s on us-east-1 and passes
+ * on ap-southeast-1). That is not a permanent defect, so it does not belong in
+ * the build-time `disabledModels` list — hiding it there would take down the
+ * region where it works, for every deployment of the artifact.
+ *
+ * Instead a model that keeps failing with an upstream `server` fault is hidden
+ * from `GET /v1/models` for a while, then re-advertised so the upstream gets
+ * re-probed. The policy is per-process, so each deployment (and each region)
+ * converges on what actually works for it.
+ */
+export interface ModelVisibilityConfig {
+  /** Consecutive upstream server failures before an id is hidden. 0 disables. Default 5. */
+  hideAfterFailures: number
+  /** How long a hidden id stays hidden before being re-advertised (ms). Default 5min. */
+  hideForMs: number
+}
+
 export function defaultConfig(): Op2gwConfig {
   const dataDir = join(homedir(), '.op2gw')
   return {
@@ -166,6 +189,16 @@ export function defaultConfig(): Op2gwConfig {
       catalogStaleMs: 15 * 60_000,
       deadRecheckMs: 5 * 60_000,
       deadEvictions: 3,
+    },
+    modelVisibility: {
+      // 5 sits above the in-request rotation count (maxAttempts defaults to 3),
+      // so one unlucky request that burns every attempt cannot hide a model by
+      // itself — but two consecutive failed requests will.
+      hideAfterFailures: 5,
+      // Short on purpose: this is a self-correcting hint, not a verdict. Five
+      // minutes is long enough to stop clients hammering a dead endpoint and
+      // short enough that a recovered model returns without an operator action.
+      hideForMs: 5 * 60_000,
     },
   }
 }
@@ -253,6 +286,15 @@ export async function loadConfig(argv: string[] = process.argv.slice(2)): Promis
   cfg.pool.pinnedExitId = env.OP2GW_POOL_PINNED ?? cfg.pool.pinnedExitId
   cfg.pool.includeDirect = coerceBool(env.OP2GW_POOL_INCLUDE_DIRECT, cfg.pool.includeDirect)
 
+  // Model visibility: 0 disables auto-hiding entirely (the pre-existing
+  // behaviour), which is the escape hatch if a deployment prefers to always
+  // advertise every free id regardless of upstream health.
+  cfg.modelVisibility.hideAfterFailures = coerceNum(
+    env.OP2GW_HIDE_AFTER_FAILURES,
+    cfg.modelVisibility.hideAfterFailures,
+  )
+  cfg.modelVisibility.hideForMs = coerceNum(env.OP2GW_HIDE_FOR_MS, cfg.modelVisibility.hideForMs)
+
   // --port / --host convenience flags.
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--port' && argv[i + 1]) cfg.port = coerceNum(argv[i + 1], cfg.port)
@@ -324,6 +366,8 @@ function mergeConfig(target: Op2gwConfig, patch: Partial<Op2gwConfig>): void {
       Object.assign(target.pool, value)
     } else if (key === 'selfHeal' && typeof value === 'object') {
       Object.assign(target.selfHeal, value)
+    } else if (key === 'modelVisibility' && typeof value === 'object') {
+      Object.assign(target.modelVisibility, value)
     } else {
       // @ts-expect-error index write across the union of scalar fields
       target[key] = value

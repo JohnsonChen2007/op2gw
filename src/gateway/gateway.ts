@@ -70,7 +70,13 @@ const DEFAULT_ROTATE_BUDGET_MS = 45_000
 export interface GatewayDeps {
   logger: Logger
   scoped: ScopedLogger
-  catalog: ModelCatalog
+  /**
+   * Model catalog. `health` is the runtime liveness signal consumed here; it is
+   * optional so lightweight catalog doubles (tests, tooling) that only answer
+   * `list()`/`decision()` remain valid deps. A missing signal just means "no
+   * auto-hide", never a thrown request.
+   */
+  catalog: ModelCatalog & { health?: ModelCatalog['health'] }
   pool: ExitPool
   dispatchers: DispatcherCache
   zenBaseUrl: string
@@ -339,6 +345,10 @@ export class Gateway {
           outcome: 'ok',
         }
         this.#d.logger.trace(trace)
+        // A clean response is positive evidence about the MODEL endpoint, so it
+        // clears any consecutive-failure streak and un-hides the id. Success
+        // always wins over past failures: a model that answers must stay listed.
+        this.#d.catalog.health?.recordSuccess(model)
         log.info('request ok', { model, exit: exit.id, attempt, stream: req.clientStream, api: wireApi, clientApi: req.api })
         return { status: 200, headers: this.#responseHeaders(req.clientStream), body, trace }
       } catch (err) {
@@ -392,6 +402,25 @@ export class Gateway {
           this.#d.pool.markGate(exit.id, model)
         } else if (status !== 400) {
           this.#d.pool.markFailure(exit.id, model, kind, retryAfterMs)
+        }
+        // Model-level liveness, deliberately separate from the exit x model
+        // bookkeeping above: when EVERY exit reports the endpoint is gone, the
+        // exit pool is not the problem and rotating cannot fix it. `ModelHealth`
+        // counts only `server` faults (never `limited`/`transport`/`region`,
+        // which say nothing about the model) and hides the id from the catalog
+        // after enough consecutive failures, then lets it expire so the
+        // upstream gets re-probed instead of being written off forever.
+        // `identityGate` faults are about our egress, not the model, so they do
+        // not count either.
+        if (!identityGate && status !== 400) {
+          const newlyHidden = this.#d.catalog.health?.recordFailure(model, kind, (err as Error).message) ?? false
+          if (newlyHidden) {
+            log.warn('model auto-hidden after consecutive upstream failures', {
+              model,
+              kind,
+              error: (err as Error).message.slice(0, 160),
+            })
+          }
         }
         story.push(`#${attempt} ${exit.id} ${identityGate ? 'identity-gate' : kind}: ${(err as Error).message.slice(0, 80)}`)
         log.warn('attempt failed', { model, exit: exit.id, attempt, kind, error: (err as Error).message })

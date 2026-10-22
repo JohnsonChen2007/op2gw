@@ -95,6 +95,11 @@ export class Runtime {
       logger: this.logger.child('catalog'),
       staleMs: config.selfHeal.catalogStaleMs,
       fetchImpl: this.#proxyFetch(),
+      // Runtime auto-hide: a model that keeps failing with an upstream `server`
+      // fault is dropped from /v1/models for a while, then re-probed. Per
+      // process, so each region converges on the ids that actually work there.
+      hideAfterFailures: config.modelVisibility.hideAfterFailures,
+      hideForMs: config.modelVisibility.hideForMs,
     })
 
     this.pool = new ExitPool({
