@@ -16,6 +16,7 @@ import {
   closeUnansweredFunctionCalls,
   isResponsesWireModel,
   normalizeChatToolCallIds,
+  stripUnsupportedChatMessageFields,
   resolveUpstreamApi,
   responsesToChatBody,
   responsesToChatCompletion,
@@ -655,7 +656,8 @@ export class Gateway {
       return shaped
     }
     const translated = clientApi === 'responses' ? responsesToChatBody(body) : body
-    const { body: shaped } = ensureChatFreeLaneShape(translated)
+    const sanitized = stripUnsupportedChatMessageFields(translated as Record<string, unknown>)
+    const { body: shaped } = ensureChatFreeLaneShape(sanitized)
     return normalizeChatToolCallIds(shaped as Record<string, unknown>)
   }
 

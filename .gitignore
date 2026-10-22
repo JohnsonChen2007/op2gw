@@ -28,6 +28,8 @@ status.json
 *.cache.json
 .env
 .env.*
+# Explicit local op2gw credential bundle (already covered by .env.*)
+.env.op2gw.local
 
 # Local verification & debug scripts with real credentials
 tlscheck.mjs

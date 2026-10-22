@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { decide, decodeModelsDev, isFreeByName, ModelCatalog } from '../dist/catalog/catalog.js'
 import type { ModelPrice } from '../dist/catalog/catalog.js'
-import { fallbackFreeModels, verifiedFreeModels, disabledModels, contextWindowOverrides, maxOutputOverride } from '../dist/catalog/static-models.js'
+import { fallbackFreeModels, verifiedFreeModels, disabledModels, contextWindowOverride, maxOutputOverride } from '../dist/catalog/static-models.js'
 import type { ScopedLogger } from '../dist/core/logger.js'
 
 /**
@@ -201,12 +201,11 @@ test('a hung catalog source is cut off by the fetch deadline', async () => {
  * `/v1/models` must surface them instead of a bare id, so a client can size its
  * own prompt against the window it will actually be truncated and billed against.
  *
- * `contextWindow` is asserted straight from metadata because no override names
- * these ids. `maxOutput` is asserted against `maxOutputOverride` instead: that
- * cap is unconditional, so it also reaches models that declare no limits at all
- * — which is why `free-without-limits` reports the cap instead of `undefined`.
+ * `contextWindow` follows the operator-wide 1M advertisement, while
+ * `maxOutput` is the uniform 128K cap — both are client-budgeting metadata,
+ * not a promise about the upstream's physical capability.
  */
-test('limits() surfaces metadata limits, with maxOutput subject to the uniform cap', async () => {
+test('limits() surfaces the operator-wide 1M/128K advertisement', async () => {
   const zenIds = ['free-with-limits', 'free-without-limits']
   const modelsDev = {
     opencode: {
@@ -235,7 +234,7 @@ test('limits() surfaces metadata limits, with maxOutput subject to the uniform c
   await catalog.refreshOnce()
 
   const withLimits = catalog.limits('free-with-limits')
-  assert.equal(withLimits?.contextWindow, 262144, 'context window is exposed')
+  assert.equal(withLimits?.contextWindow, 1048576, 'context window uses the operator-wide 1M advertisement')
   assert.equal(
     withLimits?.maxOutput,
     maxOutputOverride,
@@ -243,23 +242,18 @@ test('limits() surfaces metadata limits, with maxOutput subject to the uniform c
   )
   assert.deepEqual(
     catalog.limits('free-without-limits'),
-    maxOutputOverride === undefined
-      ? undefined
-      : { maxOutput: maxOutputOverride },
-    'a model with no declared limits still gets the unconditional cap',
+    { contextWindow: 1048576, maxOutput: 131072 },
+    'a model with no declared limits still gets the uniform 1M/128K advertisement',
   )
 })
 
 /**
- * The two advertised-limit overrides are deliberately different shapes.
- *
- * `contextWindowOverrides` is per-id: it raises ONLY the ids it names, so a
- * model already at 1M keeps its live value and an unlisted model is never
- * inflated. `maxOutputOverride` is a single unconditional cap applied to every
- * model — it lowers a generous model and raises a stingy one alike, which is
- * the point of a uniform number.
+ * The operator-facing catalog policy is uniform: every exposed model is
+ * advertised as 1M context / 128K output, regardless of the live metadata
+ * limits. This is an advertisement for client budgeting; upstream remains the
+ * source of truth for actual capability at request time.
  */
-test('context overrides raise only named ids, while maxOutputOverride caps every model', async () => {
+test('catalog advertises the uniform 1M/128K operator budget for every model', async () => {
   const zenIds = ['big-pickle', 'some-large-model', 'unlisted-model', 'no-limit-model']
   const modelsDev = {
     opencode: {
@@ -289,39 +283,8 @@ test('context overrides raise only named ids, while maxOutputOverride caps every
   })
   await catalog.refreshOnce()
 
-  // contextWindowOverrides: per-id, raising only what it names.
-  assert.equal(
-    catalog.limits('big-pickle')?.contextWindow,
-    contextWindowOverrides['big-pickle'],
-    'a named id is raised to the operator floor',
-  )
-  assert.equal(
-    catalog.limits('some-large-model')?.contextWindow,
-    1048576,
-    'a model already at 1M keeps its live value',
-  )
-  assert.equal(
-    catalog.limits('unlisted-model')?.contextWindow,
-    262144,
-    'an id outside the table is not inflated',
-  )
-
-  // maxOutputOverride: uniform, in both directions.
-  for (const id of ['big-pickle', 'some-large-model', 'unlisted-model', 'no-limit-model']) {
-    assert.equal(
-      catalog.limits(id)?.maxOutput,
-      maxOutputOverride,
-      `${id} reports the uniform max-output cap`,
-    )
+  for (const id of zenIds) {
+    assert.equal(catalog.limits(id)?.contextWindow, 1048576, `${id} advertises 1M context`)
+    assert.equal(catalog.limits(id)?.maxOutput, 131072, `${id} advertises 128K output`)
   }
-  assert.equal(
-    catalog.limits('big-pickle')?.maxOutput! > 32000,
-    true,
-    'the cap raises a model whose live value was below it',
-  )
-  assert.equal(
-    catalog.limits('some-large-model')?.maxOutput! < 524288,
-    true,
-    'the cap also lowers a model whose live value was above it',
-  )
 })

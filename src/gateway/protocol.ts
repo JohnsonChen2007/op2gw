@@ -170,6 +170,20 @@ function mergeAssistantContent(prev: unknown, next: unknown): unknown {
  * on the WIRE body, so it normalizes chat passthroughs and the output of
  * every inbound translator (responses, anthropic) in one place.
  */
+export function stripUnsupportedChatMessageFields(body: Json): Json {
+  const messages = Array.isArray(body.messages) ? (body.messages as unknown[]) : null
+  if (!messages) return body
+  let changed = false
+  const normalized = messages.map((value) => {
+    if (!isRecord(value)) return value
+    if (!Object.prototype.hasOwnProperty.call(value, 'agent') && !Object.prototype.hasOwnProperty.call(value, 'conversationRequestId')) return value
+    changed = true
+    const { agent: _agent, conversationRequestId: _conversationRequestId, ...rest } = value
+    return rest
+  })
+  return changed ? { ...body, messages: normalized } : body
+}
+
 export function normalizeChatToolCallIds(body: Json): Json {
   const messages = Array.isArray(body.messages) ? (body.messages as unknown[]) : null
   if (!messages) return body

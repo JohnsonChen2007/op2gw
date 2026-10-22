@@ -22,8 +22,8 @@
  * 4. `contextWindowOverrides` / `maxOutputOverride` — advertised token limits
  *    the operator wants clients to budget against. These change only what
  *    `GET /v1/models` advertises (`context_length` / `max_output_tokens`); they
- *    never touch the request path. Models absent from the context map keep the
- *    live models.dev value, so a genuinely large model is reported as-is.
+ *    never touch the request path. Every known model now uses the operator's
+ *    1M context floor, while the output cap is uniformly 128K.
  *
  *    Both are advertisements, not capabilities — see the warnings on each.
  *
@@ -66,12 +66,11 @@ export const fallbackFreeModels: string[] = []
  * Only ids actually below the floor belong here; anything already at or above it
  * is left to report its live models.dev value.
  */
-export const contextWindowOverrides: Record<string, number> = {
-  'deepseek-v4.1-flash-free': 1_048_576,
-  'big-pickle': 1_048_576,
-  'mimo-v2.6-flash-free': 1_048_576,
-  'glm-5.3-flash-free': 1_048_576,
-}
+/** Operator-wide advertised context floor for every catalog model. */
+export const contextWindowOverride = 1_048_576
+
+/** Kept for compatibility with callers/tests that inspect the old map export. */
+export const contextWindowOverrides: Record<string, number> = {}
 
 /**
  * Uniform advertised max-output cap, in tokens, applied to EVERY exposed model.

@@ -10,6 +10,7 @@ import {
   resolveUpstreamApi,
   isResponsesWireModel,
   stripCallerBoundReasoning,
+  stripUnsupportedChatMessageFields,
 } from '../dist/gateway/protocol.js'
 import { ensureChatFreeLaneShape, ensureResponsesFreeLaneShape } from '../dist/core/freelane.js'
 
@@ -29,6 +30,20 @@ test('resolveUpstreamApi routes contributor muse-spark ids to responses and ever
   assert.equal(resolveUpstreamApi('space-bunny-free'), 'chat')
   assert.equal(isResponsesWireModel('muse-spark-1.2-contributor-free'), true)
   assert.equal(isResponsesWireModel('big-pickle'), false)
+})
+
+test('chat wire strips CodeBuddy-only message agent metadata but preserves standard fields', () => {
+  const out = stripUnsupportedChatMessageFields({
+    model: 'beam-free',
+    messages: [
+      { role: 'user', content: 'hi', agent: 'cli', conversationRequestId: 'req-1', name: 'user-name' },
+      { role: 'assistant', content: 'hello', agent: 'cli', conversationRequestId: 'req-1' },
+    ],
+  })
+  assert.deepEqual(out.messages, [
+    { role: 'user', content: 'hi', name: 'user-name' },
+    { role: 'assistant', content: 'hello' },
+  ])
 })
 
 test('chat -> responses moves the system prompt into instructions', () => {

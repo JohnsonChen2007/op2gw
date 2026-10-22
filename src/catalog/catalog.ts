@@ -5,7 +5,7 @@ import type { ScopedLogger } from '../core/logger.js'
 import { opencodeUserAgent } from '../core/ids.js'
 import { ANONYMOUS_KEY } from '../core/freelane.js'
 import type { FreeDecision } from '../core/types.js'
-import { fallbackFreeModels, verifiedFreeModels, disabledModels, contextWindowOverrides, maxOutputOverride } from './static-models.js'
+import { fallbackFreeModels, verifiedFreeModels, disabledModels, contextWindowOverride, maxOutputOverride } from './static-models.js'
 import { ModelHealth } from './model-health.js'
 
 /**
@@ -365,10 +365,11 @@ export class ModelCatalog {
   limits(model: string): { contextWindow?: number; maxOutput?: number } | undefined {
     const price = this.#prices.get(model)
     if (!price) return undefined
-    // Overrides are resolved here, not at the S2 decode site, so the advertised
-    // limits are raised for every surface that reads limits() while the raw
-    // models.dev record (and everything keyed off cost) stays untouched.
-    const contextWindow = contextWindowOverrides[model] ?? price.contextWindow
+    // Operator policy: every exposed free model is advertised as 1M context /
+    // 128K output so clients share one predictable budget. This changes only
+    // the catalog advertisement; the upstream's actual capability remains the
+    // source of truth at request time.
+    const contextWindow = contextWindowOverride
     const maxOutput = maxOutputOverride ?? price.maxOutput
     if (contextWindow === undefined && maxOutput === undefined) return undefined
     return {

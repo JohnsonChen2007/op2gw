@@ -73,14 +73,10 @@ const plainName = (id) => pretty(id).replace(/\s*\(free\)$/, '')
 const isVision = (id) => /-vl-|-vision-|-omni-/.test(id)
 
 function readKey() {
-  if (process.env.OP2GW_API_KEY) return process.env.OP2GW_API_KEY
-  for (const f of [join(HOME, '.config/opencode/opencode.jsonc'), join(HOME, '.config/kilo/kilo.json')]) {
-    try {
-      const m = readFileSync(f, 'utf8').match(/sk-op2gw-[A-Za-z0-9]+/)
-      if (m) return m[0]
-    } catch {}
-  }
-  return ''
+  // Credentials deliberately come from the caller environment (normally by
+  // sourcing the ignored `.env.op2gw.local` bundle). Never scrape client config
+  // files: they should contain only the non-secret placeholder `public`.
+  return process.env.OP2GW_API_KEY ?? ''
 }
 
 /** Gateway is the single source of truth for the free/ in-sale set. */
